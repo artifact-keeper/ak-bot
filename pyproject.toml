@@ -1,0 +1,16 @@
+[project]
+name = "akbot"
+version = "0.1.0"
+description = "JEV-powered decision bots for the artifact-keeper GitHub org"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+akbot = "akbot.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["akbot*"]
