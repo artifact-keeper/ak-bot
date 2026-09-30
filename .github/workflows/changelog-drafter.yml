@@ -38,6 +38,9 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      # `secrets` is not an allowed context in a step `if`; env is.
+      AK_BOT_APP_ID: ${{ secrets.AK_BOT_APP_ID }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -47,7 +50,7 @@ jobs:
 
       - name: Mint an app token
         id: app
-        if: ${{ secrets.AK_BOT_APP_ID != '' }}
+        if: env.AK_BOT_APP_ID != ''
         uses: actions/create-github-app-token@v1
         with:
           app-id: ${{ secrets.AK_BOT_APP_ID }}
