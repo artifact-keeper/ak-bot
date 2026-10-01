@@ -26,6 +26,10 @@ on:
         description: 'Target repository'
         type: string
         default: 'artifact-keeper/artifact-keeper'
+      limit:
+        description: 'Max subjects to evaluate this run (blank = schedule default)'
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -88,7 +92,7 @@ jobs:
           GH_TOKEN: ${{ steps.mode.outputs.token }}
           TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
           TYPESAFE_MODEL: ${{ vars.TYPESAFE_MODEL || 'jev-latest' }}
-        run: akbot red-run-classifier --repo "${{ inputs.repo || 'artifact-keeper/artifact-keeper' }}" --since-hours 4 ${{ steps.mode.outputs.flag }}
+        run: akbot red-run-classifier --repo "${{ inputs.repo || 'artifact-keeper/artifact-keeper' }}" --since-hours 4 ${{ inputs.limit && format('--limit {0}', inputs.limit) || '' }} ${{ steps.mode.outputs.flag }}
 
       - uses: actions/upload-artifact@v4
         if: always()
