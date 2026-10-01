@@ -1,0 +1,39 @@
+name: watchdog
+
+# Daily: is ak-bot itself alive and doing what AK_BOT_LIVE says? Re-enables
+# disabled schedules, and files/updates/closes one "ak-bot watchdog" issue in
+# this repository, assigned to AK_BOT_MAINTAINER.
+
+on:
+  schedule:
+    - cron: '0 12 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Report only; do not touch issues or workflows'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+  actions: write      # gh workflow enable
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: watchdog
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AK_BOT_OWN_REPO: ${{ github.repository }}
+          AK_BOT_LIVE: ${{ vars.AK_BOT_LIVE }}
+          AK_BOT_HALT: ${{ vars.AK_BOT_HALT }}
+          AK_BOT_MAINTAINER: ${{ vars.AK_BOT_MAINTAINER }}
+          DRY: ${{ inputs.dry_run }}
+        run: python -m akbot.cli watchdog ${DRY:+--dry-run}

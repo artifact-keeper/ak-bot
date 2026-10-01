@@ -12,7 +12,7 @@ import re
 from .. import gh
 from ..context import Context
 from ..decisions import LABEL, AUTO, SUGGEST, SKIP, redact
-from ..jev import choice, noul, score
+from ..jev import JevError, choice, noul, score
 
 BOT = "issue-triage"
 QUESTIONS_VERSION = "issue-triage/q1"
@@ -63,11 +63,18 @@ def questions(labels: set[str]) -> dict[str, dict]:
     }
 
 
+AREA_LABELS = {"core", "web-ui", "ci"}
+
+
 def is_untriaged(issue: dict) -> bool:
     names = {l["name"] for l in issue.get("labels") or []}
-    if any(n.startswith("type:") for n in names) or "automated" in names:
+    if any(n.startswith("type:") or n.startswith("registry/") or n in AREA_LABELS for n in names):
+        return False          # a human or the bot has placed it; do not re-propose after ledger rollover
+    if "automated" in names:
         return False
-    if (issue.get("author") or {}).get("login", "").endswith("[bot]"):
+    author = issue.get("author") or {}
+    login = author.get("login", "")
+    if author.get("is_bot") or login.endswith("[bot]") or login.startswith("app/"):
         return False
     return True
 
@@ -108,18 +115,31 @@ def act(ctx: Context, issue: dict, res, labels: set[str]) -> None:
     route(area, area_label)
     if reg.yes:
         route(reg, "regression")
-    level = round(pri.score or 0)
-    if pri.certainty >= LABEL.suggest_at and level >= 2:
-        propose.append(f"`priority:p{3 - level}` ({pri.certainty:.2f}, never auto-applied)")
+    # Priority from probability mass, not a rounded point estimate: propose p1
+    # when the mass on {p1, p0} clears the suggest line, p0 when p0 alone holds
+    # a majority. round() would turn 1.5 into p1 and 2.5 into p1 as well.
+    if pri.probabilities:
+        high = pri.mass_at_least(2)
+        if high >= LABEL.suggest_at:
+            level = 3 if pri.mass_at_least(3) >= 0.5 else 2
+            propose.append(f"`priority:p{3 - level}` (mass {high:.2f}, never auto-applied)")
+    elif pri.score is not None and pri.certainty >= LABEL.suggest_at and pri.score >= 2:
+        propose.append(f"`priority:p{3 - min(3, int(pri.score + 0.5))}` ({pri.certainty:.2f}, never auto-applied)")
 
     tier = AUTO if apply else (SUGGEST if propose else SKIP)
     actions = []
     if apply:
         actions.append(ctx.act(f"label {', '.join(apply)}", gh.add_labels, ctx.repo, n, apply))
-    if propose:
-        body = ("ak-bot triage proposal (not applied; confidence in parentheses): " + ", ".join(propose)
-                + "\n\n<sub>Apply or ignore; ak-bot will not repeat this.</sub>")
+    # A comment goes to the reporter's inbox. Post one only when a type or
+    # area label is proposed; a priority-only proposal is maintainer metadata
+    # and lives in the ledger and the decision record instead.
+    label_props = [x for x in propose if not x.startswith("`priority:")]
+    if label_props:
+        body = ("ak-bot triage proposal (not applied; probability in parentheses): " + ", ".join(propose)
+                + "\n\n<sub>Apply or ignore; ak-bot will not repeat this. React with 👎 if it is wrong.</sub>")
         actions.append(ctx.act("comment proposal", gh.comment, ctx.repo, n, body))
+    elif propose:
+        actions.append("priority proposal recorded, not commented: " + ", ".join(propose))
     ctx.log.add(f"issue #{n}", QUESTIONS_VERSION, res.model, res.answers, tier,
                 "; ".join(actions) or "ledger only", url=issue.get("url", ""))
     ctx.ledger.record(f"triage-{n}", f"issue-triage: #{n}: {tier}: {'; '.join(actions) or 'nothing'}")
@@ -130,7 +150,11 @@ def run(ctx: Context, limit: int = 30) -> int:
     todo = [i for i in gh.list_issues(ctx.repo) if is_untriaged(i) and not ctx.ledger.has(f"triage-{i['number']}")]
     todo.sort(key=lambda i: i["number"], reverse=True)
     for issue in todo[:limit]:
-        act(ctx, issue, decide(ctx, issue, labels), labels)
+        try:
+            act(ctx, issue, decide(ctx, issue, labels), labels)
+        except (gh.GhError, JevError, KeyError, TypeError, ValueError) as e:
+            # Skip this subject only, and leave no ledger marker so it is retried.
+            ctx.log.note(f"issue #{issue['number']}", f"skipped: {type(e).__name__}: {str(e)[:200]}")
     if not todo:
         print("nothing to triage")
     return 0

@@ -17,13 +17,18 @@ from datetime import datetime, timedelta, timezone
 from .. import gh
 from ..context import Context, find_or_create_issue
 from ..decisions import OPEN_ISSUE, COMMENT, RERUN, AUTO, SUGGEST, SKIP, redact
-from ..jev import choice, noul, score
+from ..jev import JevError, choice, noul, score
 
 BOT = "red-run-classifier"
 QUESTIONS_VERSION = "red-run-classifier/q1"
 DIGEST_TITLE = "ak-bot: red run digest"
 RED = {"failure", "cancelled", "timed_out"}
 EVENTS = {"schedule", "push", "workflow_dispatch"}
+# Reruns are allowed ONLY for these. A rerun of a publish or release workflow
+# pushes artifacts; the README's "never into release gates" is enforced here,
+# by allowlist, not by trusting a flake call.
+RERUN_ALLOWED = {"CI", "Scheduled Tests", "E2E", "Mesh E2E", "Concurrency E2E", "Cache Correctness E2E",
+                 "Release Preflight", "Release Gate Rehearsal"}
 
 
 def questions() -> dict[str, dict]:
@@ -77,15 +82,24 @@ def timing_facts(run: dict, jobs: list[dict]) -> dict:
     return facts
 
 
+def marker_for(run: dict, attempt: int) -> str:
+    # The attempt is part of the identity: after an auto-rerun, attempt 2 has
+    # the same run id, and a flake that fails again must be classified, not
+    # skipped forever. It is also the strongest calibration signal there is.
+    return f"red-run-{run['databaseId']}-a{attempt}"
+
+
 def collect(ctx: Context, since_hours: float, limit: int) -> list[dict]:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=since_hours)
     out = []
     for r in gh.list_runs(ctx.repo, limit=limit):
         if r["status"] != "completed" or r["conclusion"] not in RED or r["event"] not in EVENTS:
             continue
-        if datetime.fromisoformat(r["createdAt"].replace("Z", "+00:00")) < cutoff:
+        if datetime.fromisoformat(r["updatedAt"].replace("Z", "+00:00")) < cutoff:
             continue
-        if ctx.ledger.has(f"red-run-{r['databaseId']}"):
+        meta = gh.api(f"repos/{ctx.repo}/actions/runs/{r['databaseId']}", check=False) or {}
+        r["attempt"] = int(meta.get("run_attempt") or 1)
+        if ctx.ledger.has(marker_for(r, r["attempt"])):
             continue
         out.append(r)
     return out
@@ -104,10 +118,9 @@ def decide(ctx: Context, run: dict) -> tuple[dict, object]:
     facts = timing_facts(run, jobs)
     log = gh.run_log(ctx.repo, rid, failed_only=True)
     tail = [redact(ln[:300]) for ln in log if ln.strip()][-120:]
-    meta = gh.api(f"repos/{ctx.repo}/actions/runs/{rid}", check=False) or {}
     state = {
         "run": {"id": rid, "workflow": run["workflowName"], "event": run["event"], "branch": run["headBranch"],
-                "conclusion": run["conclusion"], "attempt": meta.get("run_attempt", 1), "created": run["createdAt"]},
+                "conclusion": run["conclusion"], "attempt": run.get("attempt", 1), "created": run["createdAt"]},
         "timing": facts,
         "recent_conclusions_for_this_workflow": history(ctx, run["workflowName"]),
         "failed_log_tail": tail,
@@ -119,22 +132,27 @@ def act(ctx: Context, run: dict, state: dict, res) -> None:
     rid = run["databaseId"]
     cause, rerun, sev = res["cause"], res["rerun_would_pass"], res["severity"]
     subject = f"run {rid} ({run['workflowName']})"
-    marker = f"red-run-{rid}"
     attempt = state["run"]["attempt"]
+    marker = marker_for(run, attempt)
     notify_gap = any(j["notify_step_skipped"] for j in state["timing"]["jobs"])
     summary = (f"`{run['workflowName']}` on `{run['headBranch']}` ended **{run['conclusion']}** "
                f"([run {rid}]({run['url']})). JEV: cause `{cause.choice}` "
                f"(p={cause.probabilities.get(cause.choice, 0):.2f}, confidence {cause.certainty:.2f}), "
-               f"rerun would pass {rerun.noul:.2f}, severity {sev.score:.1f}/3.")
+               f"rerun would pass {rerun.noul_or_nan:.2f}, severity {sev.score_or_nan:.1f}/3.")
+    gap_text = ("Deterministic finding: a *Notify on failure* step was **skipped** because the job was "
+                "cancelled, not failed. `if: failure()` does not fire on a timeout; use "
+                "`if: failure() || cancelled()`.")
     if notify_gap:
-        summary += ("\n\nDeterministic finding: a *Notify on failure* step was **skipped** because the job was "
-                    "cancelled, not failed. `if: failure()` does not fire on a timeout; use "
-                    "`if: failure() || cancelled()`.")
+        summary += "\n\n" + gap_text
 
     if cause.choice in ("flake", "timeout") and rerun.yes:
         tier = RERUN.tier(min(cause.certainty, rerun.certainty))
-        if tier == AUTO and attempt == 1 and cause.choice == "flake":
+        rerunnable = run["workflowName"] in RERUN_ALLOWED and (run["event"] != "push" or run["headBranch"] == "main")
+        if tier == AUTO and attempt == 1 and cause.choice == "flake" and rerunnable:
             action = ctx.act(f"rerun failed jobs of {rid}", gh.rerun_failed, ctx.repo, rid)
+        elif tier == AUTO and attempt == 1 and cause.choice == "flake":
+            action = ctx.act("append to digest", digest, ctx, summary + "\n\nNot rerun automatically: this workflow "
+                             "is outside the rerun allowlist (publish/release workflows are never rerun by the bot).")
         elif tier in (AUTO, SUGGEST):
             action = ctx.act("append to digest", digest, ctx, summary + "\n\nNot rerun automatically"
                              + (" (already a retry)." if attempt > 1 else " (timeouts are rerun by hand: they cost 45 minutes)."))
@@ -146,8 +164,10 @@ def act(ctx: Context, run: dict, state: dict, res) -> None:
             labels = [l for l in ("ci", "type:bug") if l in gh.repo_labels(ctx.repo)]
             body = summary + "\n\n<details><summary>failed log tail</summary>\n\n```\n" + \
                    "\n".join(state["failed_log_tail"][-60:]) + "\n```\n</details>\n\n_Opened by ak-bot red-run-classifier._"
-            action = ctx.act("open issue", gh.create_issue, ctx.repo,
-                             f"ci: {run['workflowName']} is red on {run['headBranch']} ({cause.choice})", body, labels)
+            # One issue per (workflow, branch): a second red of the same thing
+            # is a comment on it, not a second issue.
+            title = f"ci: {run['workflowName']} is red on {run['headBranch']}"
+            action = ctx.act("open issue", regression_issue, ctx, title, body, labels)
         elif tier == SUGGEST:
             action = ctx.act("append to digest", digest, ctx, summary)
         else:
@@ -156,9 +176,21 @@ def act(ctx: Context, run: dict, state: dict, res) -> None:
         tier = COMMENT.tier(cause.certainty)
         action = ctx.act("append to digest", digest, ctx, summary) if tier != SKIP else "ledger only"
         if notify_gap and tier == SKIP:
-            action = ctx.act("append to digest (notify gap)", digest, ctx, summary)
+            # The deterministic finding stands on its own; do not quote an
+            # uncertain model answer next to it.
+            action = ctx.act("append to digest (notify gap)", digest, ctx,
+                             f"`{run['workflowName']}` on `{run['headBranch']}` ended **{run['conclusion']}** "
+                             f"([run {rid}]({run['url']})).\n\n" + gap_text)
     ctx.log.add(subject, QUESTIONS_VERSION, res.model, res.answers, tier, action, url=run["url"])
     ctx.ledger.record(marker, f"red-run-classifier: {subject}: {tier} -> {action}")
+
+
+def regression_issue(ctx: Context, title: str, body: str, labels: list[str]) -> str:
+    before = dict(ctx._issue_cache)
+    n = find_or_create_issue(ctx, title, labels, body)
+    if title in before or n in before.values():
+        gh.comment(ctx.repo, n, body)
+    return f"https://github.com/{ctx.repo}/issues/{n}"
 
 
 def digest(ctx: Context, text: str) -> None:
@@ -174,6 +206,9 @@ def run(ctx: Context, since_hours: float = 26.0, limit: int = 80) -> int:
         print("no new red runs")
         return 0
     for r in runs:
-        state, res = decide(ctx, r)
-        act(ctx, r, state, res)
+        try:
+            state, res = decide(ctx, r)
+            act(ctx, r, state, res)
+        except (gh.GhError, JevError, KeyError, TypeError, ValueError) as e:
+            ctx.log.note(f"run {r['databaseId']}", f"skipped: {type(e).__name__}: {str(e)[:200]}")
     return 0

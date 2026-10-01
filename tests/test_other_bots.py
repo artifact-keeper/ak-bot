@@ -50,7 +50,25 @@ class RedRunTests(unittest.TestCase):
         rr.act(c, dict(RUN, conclusion="failure"), state, c.jev.ask(state, rr.questions()))
         create.assert_not_called()          # dry run
         self.assertEqual(c.log.records[0].tier, AUTO)
-        self.assertTrue(c.ledger.has("red-run-1"))
+        self.assertTrue(c.ledger.has("red-run-1-a1"))
+
+    @mock.patch.object(gh, "repo_labels", return_value={"ci", "type:bug"})
+    @mock.patch.object(rr, "digest")
+    @mock.patch.object(gh, "rerun_failed")
+    def test_publish_workflows_are_never_rerun(self, rerun, digest, _):
+        c = ctx({"cause": {"type": "choice", "choice": "flake", "probabilities": {"flake": 0.99}, "confidence": 0.99},
+                 "rerun_would_pass": {"type": "noul", "noul": 0.99}})
+        c.dry_run = False
+        state = {"run": {"attempt": 1}, "timing": {"jobs": []}, "failed_log_tail": []}
+        run = dict(RUN, workflowName="Docker Publish", conclusion="failure", event="push", headBranch="v1.2.3")
+        with mock.patch.object(gh, "comment"), mock.patch.object(c.ledger, "record"):
+            rr.act(c, run, state, c.jev.ask(state, rr.questions()))
+        rerun.assert_not_called()
+        digest.assert_called()
+        run = dict(RUN, workflowName="CI", conclusion="failure", event="push", headBranch="main")
+        with mock.patch.object(c.ledger, "record"):
+            rr.act(c, run, state, c.jev.ask(state, rr.questions()))
+        rerun.assert_called_once()
 
 
 class TriageTests(unittest.TestCase):
@@ -73,7 +91,40 @@ class TriageTests(unittest.TestCase):
     def test_untriaged_filter(self):
         self.assertTrue(it.is_untriaged({"labels": [], "author": {"login": "x"}}))
         self.assertFalse(it.is_untriaged({"labels": [{"name": "type:bug"}], "author": {"login": "x"}}))
+        self.assertFalse(it.is_untriaged({"labels": [{"name": "registry/npm"}], "author": {"login": "x"}}))
         self.assertFalse(it.is_untriaged({"labels": [], "author": {"login": "github-actions[bot]"}}))
+        self.assertFalse(it.is_untriaged({"labels": [], "author": {"login": "app/ak-jev-bot"}}))
+        self.assertFalse(it.is_untriaged({"labels": [], "author": {"login": "x", "is_bot": True}}))
+
+    @mock.patch.object(gh, "comment")
+    @mock.patch.object(gh, "add_labels")
+    def test_priority_only_proposal_is_not_commented(self, add, comment):
+        c = ctx({"priority": {"type": "score", "score": 2.6, "probabilities": {"2": 0.3, "3": 0.6}, "confidence": 0.8}})
+        issue = {"number": 6, "title": "t", "body": "b", "labels": [], "author": {"login": "u"}, "createdAt": "x", "url": "u"}
+        it.act(c, issue, c.jev.ask({}, it.questions(self.LABELS)), self.LABELS)
+        rec = c.log.records[0]
+        self.assertEqual(rec.tier, SUGGEST)
+        self.assertIn("priority:p0", rec.action)
+        self.assertNotIn("would comment", rec.action)
+
+    @mock.patch.object(gh, "repo_labels", return_value=set())
+    @mock.patch.object(gh, "list_issues")
+    def test_one_bad_subject_does_not_abort_the_batch(self, li, _):
+        from akbot.jev import JevError
+        li.return_value = [{"number": n, "title": "t", "body": "b", "labels": [], "author": {"login": "u"},
+                            "createdAt": "x", "url": "u"} for n in (1, 2, 3)]
+        c = ctx()
+        calls = {"n": 0}
+        def ask(state, q):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise JevError(422, "too big")
+            return FakeJev().ask(state, q)
+        c.jev.ask = ask
+        it.run(c)
+        self.assertEqual(calls["n"], 3)
+        self.assertTrue(any("skipped: JevError" in r.action for r in c.log.records))
+        self.assertTrue(c.ledger.has("triage-1") and c.ledger.has("triage-3") and not c.ledger.has("triage-2"))
 
 
 TRACKER = """### What the watch found
@@ -89,6 +140,30 @@ Digest-pinned external base images under /x/docker:
 ```
 [View run](https://github.com/artifact-keeper/artifact-keeper/actions/runs/36721931735) · updated 2026-09-30
 """
+
+
+class ChangelogRunTests(unittest.TestCase):
+    def test_marker_is_keyed_on_content_and_open_drafts_count_as_existing(self):
+        from akbot.bots import changelog_drafter as cd
+        c = ctx()
+        c.ledger._seen = {"changelog-4006-4090"}
+        pf = cd.Preflight(99, "v1..HEAD", "NOT READY", "main", "abc", [cd.Undocumented(4090, "x"), cd.Undocumented(4006, "y")])
+        with mock.patch.object(cd, "pick_run", return_value=(pf, "u")), \
+             mock.patch.object(gh, "api", return_value=[]), \
+             mock.patch.object(cd, "open_draft_fragments", return_value=set()), \
+             mock.patch.object(cd, "decide_one") as decide:
+            cd.run(c)
+        decide.assert_not_called()
+
+
+class UndoTests(unittest.TestCase):
+    def test_undo_effects_dry_run(self):
+        from akbot import undo
+        self.assertIn("would remove ['type:bug']", undo.undo_effect({"kind": "label", "args": ["o/r", 5, ["type:bug"]]}, True))
+        self.assertIn("would delete comment 77", undo.undo_effect(
+            {"kind": "comment", "args": ["o/r", 5, "body"], "result": "https://github.com/o/r/issues/5#issuecomment-77"}, True))
+        self.assertIn("would retract", undo.undo_effect({"kind": "open", "result": "https://github.com/o/r/pull/8"}, True))
+        self.assertIn("cannot undo", undo.undo_effect({"kind": "rerun", "result": "u"}, True))
 
 
 class BaseImageTests(unittest.TestCase):
@@ -116,16 +191,71 @@ class PrRouterTests(unittest.TestCase):
     @mock.patch.object(gh, "add_labels")
     def test_blocker_comment_at_suggest(self, add, comment, _):
         c = ctx({"readiness": {"type": "score", "score": 1.2, "probabilities": {}, "confidence": 0.7},
-                 "blocker": {"type": "choice", "choice": "missing_linked_issue", "probabilities": {"missing_linked_issue": 0.7}, "confidence": 0.7},
+                 "blocker": {"type": "choice", "choice": "no_tests", "probabilities": {"no_tests": 0.75}, "confidence": 0.7},
                  "risk": {"type": "score", "score": 1.0, "probabilities": {}, "confidence": 0.6}})
         p = {"number": 9, "headRefOid": "abcdef1234567890", "labels": [], "url": "u"}
         pr.act(c, p, c.jev.ask({}, pr.questions()))
-        self.assertEqual(c.log.records[0].tier, SUGGEST)
+        self.assertEqual(c.log.records[0].tier, SUGGEST)      # external comments need 0.70 to suggest, 0.90 to assert
         self.assertIn("would comment blocker", c.log.records[0].action)
         self.assertTrue(c.ledger.has("pr-router-9-abcdef1234"))
 
+    @mock.patch.object(gh, "repo_labels", return_value=set())
+    def test_linked_issue_blocker_is_logged_not_commented(self, _):
+        c = ctx({"blocker": {"type": "choice", "choice": "missing_linked_issue", "probabilities": {"missing_linked_issue": 0.95}, "confidence": 0.9}})
+        p = {"number": 9, "headRefOid": "abcdef1234567890", "labels": [], "url": "u"}
+        pr.act(c, p, c.jev.ask({}, pr.questions()))
+        self.assertIn("linked-issue gate already says so", c.log.records[0].action)
+
+    @mock.patch.object(gh, "repo_labels", return_value={"needs-maintainer-review"})
+    def test_ready_requires_mass_on_top_level(self, _):
+        c = ctx({"readiness": {"type": "score", "score": 2.55, "probabilities": {"2": 0.45, "3": 0.55}, "confidence": 0.9},
+                 "blocker": {"type": "choice", "choice": "none", "probabilities": {"none": 0.95}, "confidence": 0.9}})
+        p = {"number": 9, "headRefOid": "abcdef1234567890", "labels": [], "url": "u"}
+        pr.act(c, p, c.jev.ask({}, pr.questions()))
+        self.assertEqual(c.log.records[0].tier, SKIP)
+
+    def test_say_updates_instead_of_reposting(self):
+        c = ctx()
+        c.dry_run = False
+        prev = {"id": 42, "body": "old\n\n" + pr.MARK}
+        with mock.patch.object(pr, "own_comment", return_value=prev), \
+             mock.patch.object(gh, "update_comment", return_value="42") as upd, \
+             mock.patch.object(gh, "comment") as new:
+            self.assertEqual(pr.say(c, {"number": 1}, "new text"), "42")
+            self.assertEqual(pr.say(c, {"number": 1}, "old"), "unchanged")
+        upd.assert_called_once()
+        new.assert_not_called()
+
 
 class PreflightAuditTests(unittest.TestCase):
+    @mock.patch.object(gh, "create_issue")
+    @mock.patch.object(gh, "run_artifacts", return_value=[])
+    @mock.patch.object(gh, "run_log", return_value=[])
+    @mock.patch.object(gh, "list_runs")
+    def test_cancelled_runs_and_missing_logs_never_open_issues(self, lr, log, arts, create):
+        lr.return_value = [
+            {"databaseId": 1, "status": "completed", "conclusion": "cancelled", "event": "schedule", "headBranch": "main", "headSha": "x", "url": "u"},
+            {"databaseId": 2, "status": "completed", "conclusion": "failure", "event": "schedule", "headBranch": "main", "headSha": "x", "url": "u"},
+        ]
+        c = ctx()
+        c.dry_run = False
+        pa.run(c, limit=5)
+        create.assert_not_called()
+        self.assertFalse(c.ledger.has("preflight-audit-1"))
+        self.assertFalse(c.ledger.has("preflight-audit-2"))    # log unavailable: retried next time
+
+    @mock.patch.object(gh, "create_issue")
+    @mock.patch.object(gh, "run_artifacts", return_value=[])
+    @mock.patch.object(gh, "run_log", return_value=["5) CHANGELOG", "[FAIL] x", "nothing conclusive here"])
+    @mock.patch.object(gh, "list_runs")
+    def test_no_verdict_line_is_recorded_not_filed(self, lr, log, arts, create):
+        lr.return_value = [{"databaseId": 3, "status": "completed", "conclusion": "failure", "event": "schedule",
+                            "headBranch": "main", "headSha": "x", "url": "u"}]
+        c = ctx()
+        pa.run(c, limit=1)
+        create.assert_not_called()
+        self.assertTrue(c.ledger.has("preflight-audit-3"))
+
     def test_ready_needs_matching_artifact(self):
         run = {"conclusion": "success", "event": "workflow_dispatch"}
         lines = ["READY to cut from main@" + "a" * 40 + ": no blocking problems."]

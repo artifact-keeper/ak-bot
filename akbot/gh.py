@@ -22,8 +22,10 @@ class GhError(RuntimeError):
 
 def gh(*args: str, input: str | None = None, check: bool = True) -> str:
     proc = subprocess.run(["gh", *args], input=input, capture_output=True, text=True)
-    if check and proc.returncode != 0:
-        raise GhError(f"gh {' '.join(args[:3])}... failed ({proc.returncode}): {proc.stderr.strip()[:500]}")
+    if proc.returncode != 0:
+        if check:
+            raise GhError(f"gh {' '.join(args[:3])}... failed ({proc.returncode}): {proc.stderr.strip()[:500]}")
+        print(f"[gh] non-fatal: gh {' '.join(args[:3])} exited {proc.returncode}: {proc.stderr.strip()[:200]}")
     return proc.stdout
 
 
@@ -84,15 +86,35 @@ def run_artifacts(repo: str, run_id: int) -> list[dict]:
     return (data or {}).get("artifacts", [])
 
 
-def rerun_failed(repo: str, run_id: int) -> None:
+def rerun_failed(repo: str, run_id: int) -> str:
     gh("run", "rerun", "-R", repo, str(run_id), "--failed")
+    return f"https://github.com/{repo}/actions/runs/{run_id}"
 
 
 # --- issues and PRs -----------------------------------------------------------
 
-def list_issues(repo: str, limit: int = 200, state: str = "open") -> list[dict]:
-    return gh_json("issue", "list", "-R", repo, "--state", state, "--limit", str(limit), "--json",
-                   "number,title,body,labels,createdAt,updatedAt,author,url") or []
+def list_issues(repo: str, limit: int = 1000, state: str = "open", labels: str | None = None) -> list[dict]:
+    """All open issues (not PRs) through the REST list endpoint, paginated, in
+    the field shape `gh issue list --json` uses. The CLI's --limit capped the
+    repo's 200 newest and silently dropped the rest."""
+    path = f"repos/{repo}/issues?state={state}&per_page=100"
+    if labels:
+        path += f"&labels={labels}"
+    out = []
+    for i in api(path, paginate=True) or []:
+        if "pull_request" in i:
+            continue
+        u = i.get("user") or {}
+        login = u.get("login", "")
+        if u.get("type") == "Bot" and not login.startswith("app/"):
+            login = "app/" + login.removesuffix("[bot]")
+        out.append({"number": i["number"], "title": i["title"], "body": i.get("body"),
+                    "labels": [{"name": l["name"]} for l in i.get("labels") or []],
+                    "createdAt": i["created_at"], "updatedAt": i["updated_at"],
+                    "author": {"login": login, "is_bot": u.get("type") == "Bot"}, "url": i["html_url"]})
+        if len(out) >= limit:
+            break
+    return out
 
 
 def issue_search(repo: str, query: str, limit: int = 50) -> list[dict]:
@@ -104,6 +126,12 @@ def list_prs(repo: str, limit: int = 100) -> list[dict]:
     return gh_json("pr", "list", "-R", repo, "--state", "open", "--limit", str(limit), "--json",
                    "number,title,body,author,isDraft,labels,createdAt,updatedAt,additions,deletions,"
                    "changedFiles,files,reviewDecision,mergeable,statusCheckRollup,headRefOid,url") or []
+
+
+def open_pulls(repo: str) -> list[dict]:
+    """REST listing: carries `author_association` (OWNER/MEMBER/COLLABORATOR/...),
+    which needs no org Members permission, unlike the members list."""
+    return api(f"repos/{repo}/pulls?state=open&per_page=100", paginate=True) or []
 
 
 def pr_view(repo: str, number: int) -> dict:
@@ -123,13 +151,39 @@ def issue_comments(repo: str, number: int) -> list[dict]:
     return api(f"repos/{repo}/issues/{number}/comments?per_page=100", paginate=True) or []
 
 
-def comment(repo: str, number: int, body: str) -> None:
-    gh("issue", "comment", "-R", repo, str(number), "--body", body)
+def comment(repo: str, number: int, body: str) -> str:
+    """Returns the comment URL (gh prints it), which `akbot undo` needs."""
+    return gh("issue", "comment", "-R", repo, str(number), "--body", body).strip()
 
 
-def add_labels(repo: str, number: int, labels: list[str]) -> None:
+def update_comment(repo: str, comment_id: int, body: str) -> str:
+    api(f"repos/{repo}/issues/comments/{comment_id}", "PATCH", {"body": body})
+    return str(comment_id)
+
+
+def delete_comment(repo: str, comment_id: int) -> None:
+    api(f"repos/{repo}/issues/comments/{comment_id}", "DELETE", check=False)
+
+
+def add_labels(repo: str, number: int, labels: list[str]) -> list[str]:
     if labels:
         gh("issue", "edit", "-R", repo, str(number), "--add-label", ",".join(labels))
+    return list(labels)
+
+
+def remove_labels(repo: str, number: int, labels: list[str]) -> None:
+    if labels:
+        gh("issue", "edit", "-R", repo, str(number), "--remove-label", ",".join(labels), check=False)
+
+
+def close_issue(repo: str, number: int, comment_text: str | None = None) -> None:
+    if comment_text:
+        comment(repo, number, comment_text)
+    gh("issue", "close", "-R", repo, str(number), check=False)
+
+
+def delete_branch(repo: str, branch: str) -> None:
+    api(f"repos/{repo}/git/refs/heads/{branch}", "DELETE", check=False)
 
 
 def create_issue(repo: str, title: str, body: str, labels: list[str]) -> str:
@@ -184,6 +238,11 @@ def put_file(repo: str, branch: str, path: str, content: str, message: str) -> N
     if existing:
         body["sha"] = existing[1]
     api(f"repos/{repo}/contents/{path}", "PUT", body)
+
+
+def pr_for_branch(repo: str, head: str) -> str | None:
+    prs = gh_json("pr", "list", "-R", repo, "--head", head, "--state", "open", "--json", "url") or []
+    return prs[0]["url"] if prs else None
 
 
 def open_pr(repo: str, head: str, base: str, title: str, body: str, labels: list[str]) -> str:

@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from .. import gh
 from ..context import Context
 from ..decisions import DRAFT_PR, SKIP, redact
-from ..jev import choice, noul
+from ..jev import JevError, choice, noul
 
 BOT = "changelog-drafter"
 QUESTIONS_VERSION = "changelog-drafter/q1"
@@ -280,7 +280,9 @@ def decide_one(ctx: Context, item: Undocumented, existing_names: set[str]) -> Dr
         d.note = f"a fragment leading with #{lead_ref} already exists; its lead reference may be wrong"
         action = "skip: fragment exists"
     else:
-        d.tier = DRAFT_PR.tier(sec.certainty)
+        # Both the section call and the user-visibility call have to clear the
+        # line: a 0.51 "visible" next to a 0.9 section is not an auto draft.
+        d.tier = DRAFT_PR.tier(min(sec.certainty, vis.certainty))
         if d.tier != SKIP:
             d.name, d.text = render_fragment(
                 sec.choice, lead_ref, item.pr, lead_sentence(pr["title"]),
@@ -317,51 +319,95 @@ def pr_body(pf: Preflight, drafts: list[Draft], run_url: str) -> str:
     return "\n".join(out)
 
 
-def run(ctx: Context, run_id: int | None = None) -> int:
-    if run_id is None:
-        runs = [r for r in gh.list_runs(ctx.repo, WORKFLOW, limit=10, branch="main")
-                if r["status"] == "completed" and r["conclusion"] in ("success", "failure")]
-        if not runs:
-            print("no completed preflight run on main")
-            return 0
-        run_id = runs[0]["databaseId"]
-        run_url = runs[0]["url"]
+def open_draft_fragments(ctx: Context) -> set[str]:
+    """Fragment file names already sitting in open ak-bot draft PRs, so a
+    second preflight red does not draft them again onto a new branch."""
+    names: set[str] = set()
+    prs = gh.gh_json("pr", "list", "-R", ctx.repo, "--state", "open", "--limit", "20",
+                     "--search", "head:ak-bot/changelog-", "--json", "number,headRefName,files") or []
+    for p in prs:
+        if not (p.get("headRefName") or "").startswith("ak-bot/changelog-"):
+            continue
+        for f in p.get("files") or []:
+            if f["path"].startswith("changes/unreleased/"):
+                names.add(f["path"].rsplit("/", 1)[-1])
+    return names
+
+
+def pick_run(ctx: Context, run_id: int | None) -> tuple[Preflight | None, str]:
+    """The newest completed preflight on main whose transcript audits main.
+    A dispatch with `ref: release/x` keeps headBranch=main, so the verdict
+    line is what decides; such runs are skipped, not drafted against main."""
+    if run_id is not None:
+        runs = [{"databaseId": run_id, "url": f"https://github.com/{ctx.repo}/actions/runs/{run_id}"}]
     else:
-        run_url = f"https://github.com/{ctx.repo}/actions/runs/{run_id}"
-    marker = f"changelog-{run_id}"
-    if ctx.ledger.has(marker):
-        print(f"run {run_id} already handled")
+        runs = [r for r in gh.list_runs(ctx.repo, WORKFLOW, limit=10, branch="main")
+                if r["status"] == "completed" and r["conclusion"] in ("success", "failure")][:5]
+    for r in runs:
+        pf = parse_preflight(r["databaseId"], gh.run_log(ctx.repo, r["databaseId"]))
+        if not pf.verdict:
+            ctx.log.note(f"run {r['databaseId']}", "transcript unavailable or has no verdict; skipped")
+            continue
+        if pf.audited_ref not in ("main", "refs/heads/main"):
+            ctx.log.note(f"run {r['databaseId']}", f"audited {pf.audited_ref}, not main; skipped")
+            continue
+        return pf, r["url"]
+    return None, ""
+
+
+def run(ctx: Context, run_id: int | None = None) -> int:
+    pf, run_url = pick_run(ctx, run_id)
+    if pf is None:
+        print("no usable preflight run on main")
         return 0
-    pf = parse_preflight(run_id, gh.run_log(ctx.repo, run_id))
     if not pf.undocumented:
-        ctx.log.note(f"run {run_id}", f"verdict {pf.verdict or 'unknown'}; no undocumented PRs listed")
+        ctx.log.note(f"run {pf.run_id}", f"verdict {pf.verdict}; no undocumented PRs listed")
         return 0
     listing = gh.api(f"repos/{ctx.repo}/contents/changes/unreleased", check=False)
     existing = {x["name"] for x in listing} if isinstance(listing, list) else set()
-    drafts = [decide_one(ctx, item, existing) for item in pf.undocumented]
+    existing |= open_draft_fragments(ctx)
+    # Key the marker on WHAT is undocumented, not on the run id: preflight
+    # runs daily and the same gap must produce one PR, not one per day.
+    items = pf.undocumented
+    marker = "changelog-" + "-".join(str(i.pr) for i in sorted(items, key=lambda i: i.pr))
+    if ctx.ledger.has(marker):
+        print(f"this set of undocumented PRs was already handled ({marker})")
+        return 0
+    drafts: list[Draft] = []
+    for item in items:
+        try:
+            drafts.append(decide_one(ctx, item, existing))
+        except (gh.GhError, JevError, KeyError, TypeError, ValueError) as e:
+            ctx.log.note(f"PR #{item.pr}", f"skipped: {type(e).__name__}: {str(e)[:200]}")
     to_write = [d for d in drafts if d.name]
     if not to_write:
-        ctx.log.note(f"run {run_id}", "nothing drafted; everything needs a human call")
-        ctx.ledger.record(marker, f"changelog-drafter: run {run_id}, no drafts")
+        ctx.log.note(f"run {pf.run_id}", "nothing drafted; everything needs a human call or is already drafted")
+        ctx.ledger.record(marker, f"changelog-drafter: run {pf.run_id}, no drafts")
         return 0
-    branch = f"ak-bot/changelog-{run_id}"
+    branch = f"ak-bot/changelog-{pf.run_id}"
     title = f"docs(changelog): draft fragments for {len(to_write)} undocumented PR(s) in {pf.range}"
     body = pr_body(pf, drafts, run_url)
-    labels = [l for l in ("no-issue-required", "automated", "release-process") if l in gh.repo_labels(ctx.repo)]
+    labels = [l for l in ("no-issue-required", "automated", "release-tracking") if l in gh.repo_labels(ctx.repo)]
     if ctx.dry_run:
         for d in to_write:
             print(f"--- would write changes/unreleased/{d.name}\n{d.text}")
         print(f"--- would open PR on {branch}: {title}\n{body}")
-        ctx.ledger.record(marker, f"changelog-drafter: dry run for {run_id}")
+        ctx.ledger.record(marker, f"changelog-drafter: dry run for {pf.run_id}")
         return 0
+    url = ctx.act("open draft PR", open_draft_pr, ctx, branch, to_write, title, body, labels)
+    ctx.ledger.record(marker, f"changelog-drafter: {url} with {len(to_write)} fragment(s)")
+    print(url)
+    return 0
+
+
+def open_draft_pr(ctx: Context, branch: str, drafts: list[Draft], title: str, body: str, labels: list[str]) -> str:
+    """Resumable: a branch left behind by an earlier failure is reused, and an
+    existing PR for it is returned instead of a second `pr create`."""
     base = gh.branch_sha(ctx.repo, "main")
     if not base:
         raise RuntimeError("cannot resolve main")
     gh.ensure_branch(ctx.repo, branch, base)
-    for d in to_write:
+    for d in drafts:
         gh.put_file(ctx.repo, branch, f"changes/unreleased/{d.name}", d.text,
                     f"docs(changelog): add fragment for #{d.pr} (ak-bot draft)")
-    url = gh.open_pr(ctx.repo, branch, "main", title, body, labels)
-    ctx.ledger.record(marker, f"changelog-drafter: opened {url} with {len(to_write)} fragment(s)")
-    print(url)
-    return 0
+    return gh.pr_for_branch(ctx.repo, branch) or gh.open_pr(ctx.repo, branch, "main", title, body, labels)

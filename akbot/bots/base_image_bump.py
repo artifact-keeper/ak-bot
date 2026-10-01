@@ -119,7 +119,9 @@ def bump_patch(version: str) -> str:
 
 
 def find_tracker(ctx: Context) -> dict | None:
-    for i in gh.list_issues(ctx.repo):
+    # The watch files it under type:security; filter server-side so the
+    # tracker is found however old it gets.
+    for i in gh.list_issues(ctx.repo, labels="type:security"):
         if TITLE_KEY in i["title"]:
             return i
     return None
@@ -142,8 +144,9 @@ def run(ctx: Context) -> int:
     new_digest = None
     if img["newest_tag"] and img["pinned_is_newest"] is False:
         new_digest = resolve_digest(img["image"], img["newest_tag"])
-    past = gh.gh_json("pr", "list", "-R", ctx.repo, "--state", "merged", "--search", "scanner-adapter in:title",
-                      "--limit", "5", "--json", "number,title,mergedAt") or []
+    past = [p for p in (gh.gh_json("pr", "list", "-R", ctx.repo, "--state", "merged", "--limit", "60",
+                                    "--json", "number,title,mergedAt") or [])
+            if "scanner-adapter" in p["title"]][:5]
     state = {
         "tracker": {"number": tracker["number"], "created": tracker["createdAt"], "updated": tracker["updatedAt"]},
         "image": img,
@@ -155,8 +158,8 @@ def run(ctx: Context) -> int:
     urg, rem, safe = res["urgency"], res["remedy"], res["auto_pr_safe"]
     subject = f"issue #{tracker['number']}"
     n = tracker["number"]
-    rec = (f"ak-bot base-image-bump: urgency {urg.score:.1f}/3 ({urg.certainty:.2f}), remedy `{rem.choice}` "
-           f"(p={rem.probabilities.get(rem.choice, 0):.2f}), auto-PR safe {safe.noul:.2f}.")
+    rec = (f"ak-bot base-image-bump: urgency {urg.score_or_nan:.1f}/3 ({urg.certainty:.2f}), remedy `{rem.choice}` "
+           f"(p={rem.probabilities.get(rem.choice, 0):.2f}), auto-PR safe {safe.noul_or_nan:.2f}.")
 
     if rem.choice == "repoint_to_newer_tag" and new_digest:
         tier = DRAFT_PR.tier(min(rem.certainty, safe.certainty)) if safe.yes else SUGGEST
@@ -169,10 +172,11 @@ def run(ctx: Context) -> int:
         else:
             action = "ledger only"
     elif rem.choice == "upstream_override":
-        tier = OPEN_ISSUE.tier(min(rem.certainty, urg.certainty)) if (urg.score or 0) >= 2 else COMMENT.tier(rem.certainty)
+        urgent = urg.mass_at_least(2) >= 0.5 if urg.probabilities else (urg.score or 0) >= 2
+        tier = OPEN_ISSUE.tier(min(rem.certainty, urg.certainty)) if urgent else COMMENT.tier(rem.certainty)
         sibling = f"{ctx.org}/{img['image'].split('/')[-1]}"
         cves = ", ".join(f"{f['cve']} ({f['package']} -> {f['fixed_in']})" for f in img["findings"])
-        if tier == AUTO and (urg.score or 0) >= 2:
+        if tier == AUTO and urgent:
             action = ctx.act(f"open override request in {sibling}", open_upstream_issue, ctx, sibling, img, n)
         elif tier in (AUTO, SUGGEST):
             action = ctx.act("comment recommendation", gh.comment, ctx.repo, n,
@@ -189,21 +193,37 @@ def run(ctx: Context) -> int:
     return 0
 
 
-def open_repoint_pr(ctx: Context, img: dict, new_digest: str, tracker: int) -> None:
+def open_repoint_pr(ctx: Context, img: dict, new_digest: str, tracker: int) -> str:
+    """Resumable and honest: an existing PR for the branch is returned, a
+    half-finished branch is completed, and nothing reports success it did
+    not achieve (every failure raises, so no ledger marker is written)."""
     base = gh.branch_sha(ctx.repo, "main")
+    if not base:
+        raise RuntimeError("cannot resolve main")
     tag = img["newest_tag"]
     branch = f"ak-bot/base-image-{re.sub(r'[^a-z0-9.-]', '-', tag.lower())}"
     if not gh.ensure_branch(ctx.repo, branch, base):
-        return
-    df, _ = gh.get_file(ctx.repo, DOCKERFILE, branch)
+        existing = gh.pr_for_branch(ctx.repo, branch)
+        if existing:
+            return existing
+    got = gh.get_file(ctx.repo, DOCKERFILE, branch)
+    if not got:
+        raise RuntimeError(f"{DOCKERFILE} missing on {branch}")
+    df, _ = got
     old_line = f"{img['image']}@{img['pinned_digest']}"
-    if old_line not in df:
+    new_line = f"{img['image']}@{new_digest}"
+    if old_line in df:
+        gh.put_file(ctx.repo, branch, DOCKERFILE, df.replace(old_line, new_line),
+                    f"chore(scanner-adapter): repoint {img['image'].split('/')[-1]} base image to {tag}")
+    elif new_line not in df:
         raise RuntimeError(f"{DOCKERFILE} no longer pins {old_line}")
-    gh.put_file(ctx.repo, branch, DOCKERFILE, df.replace(old_line, f"{img['image']}@{new_digest}"),
-                f"chore(scanner-adapter): repoint {img['image'].split('/')[-1]} base image to {tag}")
-    ver, _ = gh.get_file(ctx.repo, VERSION_FILE, branch)
-    newver = bump_patch(ver)
-    gh.put_file(ctx.repo, branch, VERSION_FILE, newver + "\n", f"chore(scanner-adapter): publish {newver}")
+    got = gh.get_file(ctx.repo, VERSION_FILE, "main")
+    if not got:
+        raise RuntimeError(f"{VERSION_FILE} missing on main")
+    newver = bump_patch(got[0])
+    on_branch = gh.get_file(ctx.repo, VERSION_FILE, branch)
+    if not on_branch or on_branch[0].strip() != newver:
+        gh.put_file(ctx.repo, branch, VERSION_FILE, newver + "\n", f"chore(scanner-adapter): publish {newver}")
     cves = "\n".join(f"- {f['severity']} {f['cve']} in {f['package']} {f['installed']} (fixed in {f['fixed_in']})"
                      for f in img["findings"])
     body = (f"Fixes #{tracker}\n\nThe weekly watch found the pinned `{img['image']}` digest carries fixed findings:\n\n"
@@ -211,15 +231,16 @@ def open_repoint_pr(ctx: Context, img: dict, new_digest: str, tracker: int) -> N
             f"`{newver}` so the adapter republishes under a new exact tag.\n\n_Opened by ak-bot base-image-bump; "
             f"the digest was resolved from ghcr.io at open time._")
     labels = [l for l in ("automated", "type:security") if l in gh.repo_labels(ctx.repo)]
-    print(gh.open_pr(ctx.repo, branch, "main", f"chore(scanner-adapter): rebuild on {tag} and publish {newver}", body, labels))
+    return gh.open_pr(ctx.repo, branch, "main", f"chore(scanner-adapter): rebuild on {tag} and publish {newver}", body, labels)
 
 
-def open_upstream_issue(ctx: Context, sibling: str, img: dict, tracker: int) -> None:
+def open_upstream_issue(ctx: Context, sibling: str, img: dict, tracker: int) -> str:
     cve_ids = [f["cve"] for f in img["findings"]]
-    existing = gh.issue_search(sibling, " ".join(cve_ids)) if cve_ids else []
+    existing = [h for h in (gh.issue_search(sibling, " ".join(cve_ids)) if cve_ids else [])
+                if h["state"].lower() == "open"]
     if existing:
         gh.comment(ctx.repo, tracker, f"ak-bot: an override request already exists upstream: {existing[0]['url']}")
-        return
+        return existing[0]["url"]
     body = ("The digest-pinned image consumed by artifact-keeper/artifact-keeper#%d carries fixed findings under "
             "`--severity CRITICAL,HIGH --ignore-unfixed`:\n\n%s\n\nPlease build with the fixed versions and tag "
             "the next `-rN`; artifact-keeper will repoint the digest.\n\n_Opened by ak-bot._") % (
@@ -227,3 +248,4 @@ def open_upstream_issue(ctx: Context, sibling: str, img: dict, tracker: int) -> 
                            for f in img["findings"]))
     url = gh.create_issue(sibling, f"Dependency override needed: {', '.join(cve_ids)}", body, [])
     gh.comment(ctx.repo, tracker, f"ak-bot opened the upstream override request: {url}")
+    return url

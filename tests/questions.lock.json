@@ -1,0 +1,26 @@
+{
+  "base-image-bump": [
+    "base-image-bump/q1",
+    "24c05ad2f0"
+  ],
+  "changelog-drafter": [
+    "changelog-drafter/q1",
+    "329d591213"
+  ],
+  "issue-triage": [
+    "issue-triage/q1",
+    "dd31da3c66"
+  ],
+  "pr-review-router": [
+    "pr-review-router/q1",
+    "97d8abacbf"
+  ],
+  "preflight-audit": [
+    "preflight-audit/q1",
+    "7a19e72a8c"
+  ],
+  "red-run-classifier": [
+    "red-run-classifier/q1",
+    "2709f941dd"
+  ]
+}

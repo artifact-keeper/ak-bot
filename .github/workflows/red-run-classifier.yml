@@ -1,17 +1,18 @@
 name: red-run-classifier
 
-# Every three hours: classify red scheduled/main runs, rerun flakes, file regressions, digest the rest.
+# Every three hours with an 8h lookback: classify red scheduled/main runs; rerun allowlisted flakes once, file regressions, digest the rest.
 #
-# Identity, in order of preference:
-#   1. a GitHub App (secrets AK_BOT_APP_ID + AK_BOT_APP_PRIVATE_KEY): actions
-#      show as "<app>[bot]", tokens are minted per run and expire in an hour;
-#   2. a token (secret AK_BOT_TOKEN): fine-grained PAT of a machine user;
-#   3. github.token: read-only against other repos, so dry-run only.
+# Identity, in order of preference: a GitHub App (secrets AK_BOT_APP_ID and
+# AK_BOT_APP_PRIVATE_KEY; the token is minted per run, scoped to exactly the
+# repositories and permissions this bot needs, and revoked at the end), then
+# a token (secret AK_BOT_TOKEN), then github.token, which cannot write to
+# other repos and therefore forces dry-run.
 #
-# Live vs dry-run: a manual dispatch honours its dry_run input. A scheduled
-# run is live only when the repository variable AK_BOT_LIVE lists this bot
-# by name (comma-separated) or is "all". Without TYPESAFE_API_KEY the fake
-# model answers and every decision lands in the skip tier.
+# Live vs dry: a manual dispatch honours its dry_run input (only the literal
+# string "false" goes live). A scheduled run is live only when the repository
+# variable AK_BOT_LIVE lists this bot by name (comma-separated, any
+# whitespace or case) or is "all". AK_BOT_HALT set to anything stops every
+# write and every JEV call on the next run, without touching AK_BOT_LIVE.
 
 on:
   schedule:
@@ -23,7 +24,7 @@ on:
         type: boolean
         default: true
       repo:
-        description: 'Target repository'
+        description: 'Target repository (must be in the allowlist)'
         type: string
         default: 'artifact-keeper/artifact-keeper'
       limit:
@@ -32,7 +33,8 @@ on:
         default: ''
 
 permissions:
-  contents: read
+  contents: write     # commit decision records to this repo's records branch
+  issues: write       # the failure alert and the watchdog issue, in this repo
 
 concurrency:
   group: red-run-classifier
@@ -43,61 +45,108 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      # `secrets` is not an allowed context in a step `if`; env is.
+      # secrets is not an allowed context in a step if; env is.
       AK_BOT_APP_ID: ${{ secrets.AK_BOT_APP_ID }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
-      - run: pip install -e .
 
-      - name: Mint an app token
+      - name: Mint a scoped app token
         id: app
         if: env.AK_BOT_APP_ID != ''
-        uses: actions/create-github-app-token@v1
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ secrets.AK_BOT_APP_ID }}
           private-key: ${{ secrets.AK_BOT_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
+          repositories: artifact-keeper
+          permission-metadata: read
+          permission-actions: write
+          permission-issues: write
 
       - name: Decide identity and mode
         id: mode
         env:
-          APP_TOKEN: ${{ steps.app.outputs.token }}
-          PAT: ${{ secrets.AK_BOT_TOKEN }}
+          HAS_APP: ${{ steps.app.outputs.token != '' }}
+          HAS_PAT: ${{ secrets.AK_BOT_TOKEN != '' }}
+          HAS_KEY: ${{ secrets.TYPESAFE_API_KEY != '' }}
+          EVENT: ${{ github.event_name }}
+          DRY_INPUT: ${{ inputs.dry_run }}
           LIVE_LIST: ${{ vars.AK_BOT_LIVE }}
+          HALT: ${{ vars.AK_BOT_HALT }}
+          BOT: red-run-classifier
         run: |
-          token="${APP_TOKEN:-${PAT:-}}"
-          if [ -z "$token" ]; then
-            token="${{ github.token }}"; can_write=false
-          else
-            can_write=true
-          fi
-          echo "::add-mask::$token"
-          echo "token=$token" >> "$GITHUB_OUTPUT"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            dry="${{ inputs.dry_run }}"
-          elif [ "$can_write" = true ] && { [ "$LIVE_LIST" = "all" ] || echo ",$LIVE_LIST," | grep -q ",red-run-classifier,"; }; then
+          identity=github.token; can_write=false
+          if [ "$HAS_APP" = true ]; then identity=app; can_write=true
+          elif [ "$HAS_PAT" = true ]; then identity=pat; can_write=true; fi
+          live_list=$(printf '%s' "$LIVE_LIST" | tr -d '[:space:]' | tr 'A-Z' 'a-z')
+          listed=false
+          if [ "$live_list" = all ] || printf ',%s,' "$live_list" | grep -q ",$BOT,"; then listed=true; fi
+          dry=true
+          if [ "$EVENT" = workflow_dispatch ]; then
+            [ "$DRY_INPUT" = false ] && dry=false
+          elif [ "$listed" = true ]; then
             dry=false
-          else
-            dry=true
           fi
           [ "$can_write" = true ] || dry=true
-          echo "flag=$([ "$dry" = "true" ] && echo --dry-run)" >> "$GITHUB_OUTPUT"
-          echo "dry_run=$dry" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$HALT" ]; then
+            echo "::warning title=ak-bot halted::AK_BOT_HALT=$HALT; no writes and no JEV calls this run"
+          elif [ "$listed" = true ] && [ "$can_write" != true ]; then
+            echo "::warning title=no write identity::AK_BOT_LIVE lists $BOT but no App or token secret is set; running dry"
+          fi
+          [ "$HAS_KEY" = true ] || echo "::notice::TYPESAFE_API_KEY is not set; the fake model answers (everything skips)"
+          echo "::notice::$BOT mode: dry_run=$dry identity=$identity listed=$listed"
+          [ "$dry" = false ] || echo "flag=--dry-run" >> "$GITHUB_OUTPUT"
+          echo "identity=$identity" >> "$GITHUB_OUTPUT"
+          echo "dry_run=$dry identity=$identity" >> "$GITHUB_STEP_SUMMARY"
 
       - name: red-run-classifier
         env:
-          GH_TOKEN: ${{ steps.mode.outputs.token }}
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.AK_BOT_TOKEN || github.token }}
           TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
           TYPESAFE_MODEL: ${{ vars.TYPESAFE_MODEL || 'jev-latest' }}
-        run: akbot red-run-classifier --repo "${{ inputs.repo || 'artifact-keeper/artifact-keeper' }}" --since-hours 4 ${{ inputs.limit && format('--limit {0}', inputs.limit) || '' }} ${{ steps.mode.outputs.flag }}
+          AK_BOT_HALT: ${{ vars.AK_BOT_HALT }}
+          AK_BOT_IDENTITY: ${{ steps.mode.outputs.identity }}
+          AK_BOT_MAX_JEV_CALLS: ${{ vars.AK_BOT_MAX_JEV_CALLS }}
+          REPO: ${{ inputs.repo || 'artifact-keeper/artifact-keeper' }}
+          LIMIT: ${{ inputs.limit }}
+        run: python -m akbot.cli red-run-classifier --repo "$REPO" --since-hours 8 ${LIMIT:+--limit "$LIMIT"} ${{ steps.mode.outputs.flag }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: decisions-red-run-classifier-${{ github.run_id }}
+          name: decisions-red-run-classifier-${{ github.run_id }}-${{ github.run_attempt }}
           path: decisions/
           if-no-files-found: ignore
           retention-days: 90
+
+      - name: Keep decision records
+        # Every run commits its records to the records branch: that is the
+        # calibration data set, the watchdog's heartbeat, and the activity
+        # that keeps GitHub from disabling these schedules after 60 idle days.
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          for f in decisions/*.jsonl; do
+            gh api -X PUT "repos/${{ github.repository }}/contents/records/$(date -u +%Y/%m)/$(basename "$f")" \
+              -f branch=records -f message="records: $(basename "$f") (run ${{ github.run_id }})" \
+              -f content="$(base64 -w0 "$f")" --silent
+          done
+
+      - name: Alert on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: "ak-bot: red-run-classifier failed"
+          URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          n=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "\"$TITLE\" in:title" --json number,title \
+                --jq ".[] | select(.title == \"$TITLE\") | .number" | head -1)
+          body="Run $URL failed (event: $GITHUB_EVENT_NAME, attempt: $GITHUB_RUN_ATTEMPT)."
+          if [ -n "$n" ]; then gh issue comment -R "$GITHUB_REPOSITORY" "$n" --body "$body"
+          else gh issue create -R "$GITHUB_REPOSITORY" --title "$TITLE" --body "$body"; fi

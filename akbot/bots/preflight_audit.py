@@ -18,8 +18,8 @@ import re
 
 from .. import gh
 from ..context import Context, find_or_create_issue
-from ..decisions import COMMENT, AUTO, SUGGEST, SKIP
-from ..jev import noul
+from ..decisions import COMMENT, AUTO, SUGGEST, SKIP, redact
+from ..jev import JevError, noul
 
 BOT = "preflight-audit"
 QUESTIONS_VERSION = "preflight-audit/q1"
@@ -57,10 +57,9 @@ def deterministic(run: dict, lines: list[str], artifacts: list[dict]) -> tuple[d
         if m:
             facts["verdict"], facts["audited_ref"], facts["audited_sha"] = m.group(1), m.group(2), m.group(3)
     facts["evidence_artifacts"] = [a["name"] for a in artifacts if ARTIFACT_RE.match(a["name"])]
-    problems = []
+    problems: list[str] = []
     if facts["verdict"] is None:
-        problems.append("no verdict line in the transcript")
-        return facts, problems
+        return facts, problems          # not auditable; the caller decides, never an issue
     ev = facts["evidence_artifacts"]
     if facts["verdict"] == "READY":
         if len(ev) != 1:
@@ -81,48 +80,63 @@ def deterministic(run: dict, lines: list[str], artifacts: list[dict]) -> tuple[d
 
 
 def run(ctx: Context, limit: int = 3) -> int:
-    runs = [r for r in gh.list_runs(ctx.repo, WORKFLOW, limit=limit + 5) if r["status"] == "completed"][:limit]
+    runs = [r for r in gh.list_runs(ctx.repo, WORKFLOW, limit=limit + 5)
+            if r["status"] == "completed" and r["conclusion"] in ("success", "failure")][:limit]
     for r in runs:
-        rid = r["databaseId"]
-        marker = f"preflight-audit-{rid}"
-        if ctx.ledger.has(marker):
-            continue
-        lines = gh.run_log(ctx.repo, rid)
-        facts, problems = deterministic(r, lines, gh.run_artifacts(ctx.repo, rid))
-        subject = f"preflight run {rid}"
-        if problems:
-            body = (f"Release preflight [run {rid}]({r['url']}) on `{r['headBranch']}` is internally inconsistent:\n\n"
-                    + "\n".join(f"- {p}" for p in problems)
-                    + f"\n\nVerdict line: `{facts['verdict']} {facts['audited_ref']}@{facts['audited_sha']}`; "
-                      f"evidence artifacts: {facts['evidence_artifacts'] or 'none'}.\n\n_Opened by ak-bot preflight-audit._")
-            labels = [l for l in ("release-process", "ci", "priority:p1") if l in gh.repo_labels(ctx.repo)]
-            action = ctx.act("open issue", gh.create_issue, ctx.repo,
-                             f"release: preflight run {rid} verdict does not match its evidence", body, labels)
-            ctx.log.note(subject, action)
-            ctx.ledger.record(marker, f"preflight-audit: {subject}: deterministic mismatch -> {action}")
-            continue
-        state = {
-            "run": {"id": rid, "event": r["event"], "branch": r["headBranch"], "head_sha": r["headSha"],
-                    "conclusion": r["conclusion"]},
-            "facts": facts,
-            "transcript_check_lines": [ln.strip() for ln in lines if CHECK_LINE_RE.match(ln)][:120],
-        }
-        res = ctx.jev.ask(state, questions())
-        sup, conf, weak = res["verdict_supported"], res["scope_confusion"], res["weakened_by_skips"]
-        worst = max(1 - (sup.noul or 1), conf.noul or 0, weak.noul or 0)
-        tier = COMMENT.tier(worst) if worst >= 0.5 else SKIP
-        text = (f"[run {rid}]({r['url']}) `{facts['verdict']}` for `{facts['audited_ref']}@{facts['audited_sha'][:10]}`: "
-                f"verdict supported {sup.noul:.2f}, scope confusion {conf.noul:.2f}, weakened by skips {weak.noul:.2f}. "
-                f"Deterministic checks passed.")
-        if tier in (AUTO, SUGGEST):
-            action = ctx.act("append to digest", digest, ctx, text)
-        else:
-            action = "ledger only"
-        ctx.log.add(subject, QUESTIONS_VERSION, res.model, res.answers, tier, action, url=r["url"])
-        ctx.ledger.record(marker, f"preflight-audit: {subject}: {tier} -> {action}")
+        try:
+            audit_one(ctx, r)
+        except (gh.GhError, JevError, KeyError, TypeError, ValueError) as e:
+            ctx.log.note(f"preflight run {r['databaseId']}", f"skipped: {type(e).__name__}: {str(e)[:200]}")
     if not runs:
         print("no preflight runs")
     return 0
+
+
+def audit_one(ctx: Context, r: dict) -> None:
+    rid = r["databaseId"]
+    marker = f"preflight-audit-{rid}"
+    if ctx.ledger.has(marker):
+        return
+    lines = gh.run_log(ctx.repo, rid)
+    subject = f"preflight run {rid}"
+    if not lines:
+        ctx.log.note(subject, "log unavailable; not audited (will retry)")
+        return
+    facts, problems = deterministic(r, lines, gh.run_artifacts(ctx.repo, rid))
+    if facts["verdict"] is None:
+        ctx.log.note(subject, "no verdict line in the transcript; not auditable")
+        ctx.ledger.record(marker, f"preflight-audit: {subject}: no verdict line")
+        return
+    if problems:
+        body = (f"Release preflight [run {rid}]({r['url']}) on `{r['headBranch']}` is internally inconsistent:\n\n"
+                + "\n".join(f"- {p}" for p in problems)
+                + f"\n\nVerdict line: `{facts['verdict']} {facts['audited_ref']}@{facts['audited_sha']}`; "
+                  f"evidence artifacts: {facts['evidence_artifacts'] or 'none'}.\n\n_Opened by ak-bot preflight-audit._")
+        labels = [l for l in ("release-process", "ci", "priority:p1") if l in gh.repo_labels(ctx.repo)]
+        action = ctx.act("open issue", gh.create_issue, ctx.repo,
+                         f"release: preflight run {rid} verdict does not match its evidence", body, labels)
+        ctx.log.note(subject, action)
+        ctx.ledger.record(marker, f"preflight-audit: {subject}: deterministic mismatch -> {action}")
+        return
+    state = {
+        "run": {"id": rid, "event": r["event"], "branch": r["headBranch"], "head_sha": r["headSha"],
+                "conclusion": r["conclusion"]},
+        "facts": facts,
+        "transcript_check_lines": [redact(ln.strip()) for ln in lines if CHECK_LINE_RE.match(ln)][:120],
+    }
+    res = ctx.jev.ask(state, questions())
+    sup, conf, weak = res["verdict_supported"], res["scope_confusion"], res["weakened_by_skips"]
+    # Each noul is a probability of a problem (for `sup`, of the verdict being
+    # unsupported). Route on the certainty of the worst one, the same |2p-1|
+    # scale every other bot uses, and only when it leans towards a problem.
+    bad = max(1 - (sup.noul if sup.noul is not None else 1.0), conf.noul or 0.0, weak.noul or 0.0)
+    tier = COMMENT.tier(abs(2 * bad - 1)) if bad > 0.5 else SKIP
+    text = (f"[run {rid}]({r['url']}) `{facts['verdict']}` for `{facts['audited_ref']}@{facts['audited_sha'][:10]}`: "
+            f"verdict supported {sup.noul_or_nan:.2f}, scope confusion {conf.noul_or_nan:.2f}, "
+            f"weakened by skips {weak.noul_or_nan:.2f}. Deterministic checks passed.")
+    action = ctx.act("append to digest", digest, ctx, text) if tier in (AUTO, SUGGEST) else "ledger only"
+    ctx.log.add(subject, QUESTIONS_VERSION, res.model, res.answers, tier, action, url=r["url"])
+    ctx.ledger.record(marker, f"preflight-audit: {subject}: {tier} -> {action}")
 
 
 def digest(ctx: Context, text: str) -> None:

@@ -13,12 +13,18 @@ from datetime import datetime, timezone
 
 from .. import gh
 from ..context import Context
-from ..decisions import LABEL, COMMENT, AUTO, SUGGEST, SKIP, redact
-from ..jev import choice, score
+from ..decisions import LABEL, EXTERNAL_COMMENT, AUTO, SUGGEST, SKIP, redact
+from ..jev import JevError, choice, score
 
 BOT = "pr-review-router"
 QUESTIONS_VERSION = "pr-review-router/q1"
 READY_LABEL = "needs-maintainer-review"
+HANDLED_LABELS = {"needs-maintainer-review", "review-in-progress", "ready-to-merge"}
+MARK = "<!-- ak-bot:pr-router -->"
+# The linked-issue gate already posts and maintains its own comment; this bot
+# does not repeat it. It stays in the question so JEV can pick it, and is then
+# logged rather than commented.
+SILENT_BLOCKERS = {"missing_linked_issue"}
 LINK_RE = re.compile(r"\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*(?:[\w.-]+/[\w.-]+)?#\d+", re.I)
 TEST_PATH_RE = re.compile(r"(^|/)(tests?|spec|__tests__|e2e)(/|$)|_test\.|\.test\.|\.spec\.")
 BLOCKER_TEXT = {
@@ -80,31 +86,56 @@ def build_state(ctx: Context, pr: dict) -> dict:
     }
 
 
+def own_comment(ctx: Context, number: int) -> dict | None:
+    for c in gh.issue_comments(ctx.repo, number):
+        if MARK in (c.get("body") or ""):
+            return c
+    return None
+
+
+def say(ctx: Context, pr: dict, text: str) -> str:
+    """One bot comment per PR, edited in place when the verdict changes, so
+    an active contributor is not followed by a new comment on every push."""
+    body = f"{text}\n\n{MARK}"
+    prev = own_comment(ctx, pr["number"])
+    if prev:
+        if (prev.get("body") or "").strip() == body.strip():
+            return "unchanged"
+        return gh.update_comment(ctx.repo, prev["id"], body)
+    return gh.comment(ctx.repo, pr["number"], body)
+
+
 def act(ctx: Context, pr: dict, res) -> None:
     n = pr["number"]
     ready, blocker, risk = res["readiness"], res["blocker"], res["risk"]
     marker = f"pr-router-{n}-{pr['headRefOid'][:10]}"
     labels = gh.repo_labels(ctx.repo)
-    risk_txt = f"risk {risk.score:.1f}/3"
-    if (ready.score or 0) >= 2.5 and blocker.choice == "none":
-        tier = LABEL.tier(min(ready.certainty, blocker.certainty))
+    risk_txt = f"risk {risk.score_or_nan:.1f}/3"
+    # "ready" means the probability mass on the top rubric level, not a
+    # rounded expectation: a 55/45 split between levels 2 and 3 is not ready.
+    p_ready = ready.mass_at_least(3) if ready.probabilities else (1.0 if (ready.score or 0) >= 2.5 else 0.0)
+    if blocker.choice == "none" and p_ready >= LABEL.auto_at:
+        tier = LABEL.tier(min(p_ready, blocker.certainty))
         if tier == AUTO:
             acts = []
             if READY_LABEL in labels and READY_LABEL not in [l["name"] for l in pr.get("labels") or []]:
                 acts.append(ctx.act(f"label {READY_LABEL}", gh.add_labels, ctx.repo, n, [READY_LABEL]))
-            acts.append(ctx.act("comment ready", gh.comment, ctx.repo, n,
+            acts.append(ctx.act("comment ready", say, ctx, pr,
                                 f"ak-bot: this looks ready for maintainer review ({risk_txt}, "
-                                f"readiness {ready.score:.1f}/3 at confidence {ready.certainty:.2f})."))
+                                f"p(ready) {p_ready:.2f})."))
             action = "; ".join(acts)
         else:
             action = "ledger only"
     elif blocker.choice and blocker.choice != "none":
-        tier = COMMENT.tier(blocker.certainty)
-        if tier in (AUTO, SUGGEST):
+        tier = EXTERNAL_COMMENT.tier(blocker.certainty)
+        if blocker.choice in SILENT_BLOCKERS:
+            action = f"blocker {blocker.choice} logged; the linked-issue gate already says so"
+        elif tier in (AUTO, SUGGEST):
             hedge = "" if tier == AUTO else "possibly "
-            action = ctx.act("comment blocker", gh.comment, ctx.repo, n,
+            action = ctx.act("comment blocker", say, ctx, pr,
                              f"ak-bot: before a maintainer review, {hedge}{BLOCKER_TEXT[blocker.choice]} "
-                             f"(confidence {blocker.certainty:.2f}; {risk_txt}). Push a new commit and this is re-evaluated.")
+                             f"(p {blocker.certainty:.2f}; {risk_txt}). Push a new commit and this is re-evaluated; "
+                             f"react with 👎 if this is wrong.")
         else:
             action = "ledger only"
     else:
@@ -113,18 +144,32 @@ def act(ctx: Context, pr: dict, res) -> None:
     ctx.ledger.record(marker, f"pr-review-router: #{n}@{pr['headRefOid'][:10]}: {tier} -> {action}")
 
 
+INTERNAL = {"OWNER", "MEMBER", "COLLABORATOR"}
+
+
 def run(ctx: Context, limit: int = 20) -> int:
-    members = gh.org_members(ctx.org)
+    # author_association comes from the REST listing and needs no org
+    # Members permission; the members list is empty under a token without it,
+    # which would make every maintainer PR look external.
+    assoc = {p["number"]: p.get("author_association", "NONE") for p in gh.open_pulls(ctx.repo)}
     todo = []
     for pr in gh.list_prs(ctx.repo):
         author = (pr.get("author") or {}).get("login", "")
-        if pr.get("isDraft") or author in members or author.endswith("[bot]") or author == "app/dependabot":
+        if pr.get("isDraft") or author.endswith("[bot]") or author.startswith("app/"):
             continue
+        if assoc.get(pr["number"], "NONE") in INTERNAL:
+            continue
+        names = {l["name"] for l in pr.get("labels") or []}
+        if names & HANDLED_LABELS or (pr.get("reviewDecision") or ""):
+            continue          # a maintainer is already on it
         if ctx.ledger.has(f"pr-router-{pr['number']}-{pr['headRefOid'][:10]}"):
             continue
         todo.append(pr)
     for pr in todo[:limit]:
-        act(ctx, pr, ctx.jev.ask(build_state(ctx, pr), questions()))
+        try:
+            act(ctx, pr, ctx.jev.ask(build_state(ctx, pr), questions()))
+        except (gh.GhError, JevError, KeyError, TypeError, ValueError) as e:
+            ctx.log.note(f"PR #{pr['number']}", f"skipped: {type(e).__name__}: {str(e)[:200]}")
     if not todo:
         print("no external PRs to route")
     return 0
