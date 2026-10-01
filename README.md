@@ -1,5 +1,7 @@
 # ak-bot
 
+<img src="assets/avatar.png" alt="Jev, the ak-bot avatar" width="160" align="right">
+
 Decision bots for the [artifact-keeper](https://github.com/artifact-keeper) org, powered by
 TypeSafe's JEV (System One) model. JEV returns typed decisions with probabilities, not text;
 the bots turn those into labels, comments, drafted PRs and reruns, and never into merges,
