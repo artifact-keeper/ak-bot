@@ -279,3 +279,51 @@ class PreflightAuditTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ApprovalTests(unittest.TestCase):
+    LABELS = {"type:bug", "registry/npm", "priority:p1", "core"}
+
+    def _c(self):
+        c = ctx()
+        c.dry_run = False
+        return c
+
+    @mock.patch.object(gh, "repo_owner", return_value="brandonrc")
+    @mock.patch.object(gh, "update_comment")
+    @mock.patch.object(gh, "add_labels", return_value=["type:bug", "registry/npm"])
+    def test_thumbs_up_from_owner_applies_proposed_labels(self, add, upd, _):
+        body = "ak-bot triage proposal (not applied): `type:bug` (0.7), `registry/npm` (0.65), `priority:p1` (0.6)"
+        with mock.patch.object(gh, "search_issues_with_comment", return_value=[5]), \
+             mock.patch.object(gh, "issue_comments", return_value=[{"id": 11, "body": body}]), \
+             mock.patch.object(gh, "comment_reactions", return_value=[{"content": "+1", "user": {"login": "brandonrc"}}]):
+            n = it.apply_approved(self._c(), self.LABELS)
+        self.assertEqual(n, 1)
+        add.assert_called_once_with("o/r", 5, ["type:bug", "registry/npm", "priority:p1"])
+        self.assertIn("applied by @brandonrc", upd.call_args[0][2])
+
+    @mock.patch.object(gh, "repo_owner", return_value="brandonrc")
+    @mock.patch.object(gh, "update_comment")
+    @mock.patch.object(gh, "add_labels")
+    def test_strangers_and_handled_comments_are_ignored(self, add, upd, _):
+        body = "ak-bot triage proposal (not applied): `type:bug` (0.7)"
+        with mock.patch.object(gh, "search_issues_with_comment", return_value=[5, 6]), \
+             mock.patch.object(gh, "issue_comments", side_effect=lambda r, n: [{"id": n, "body": body if n == 5 else body + "\n<sub>applied by @x via 👍</sub>"}]), \
+             mock.patch.object(gh, "comment_reactions", return_value=[{"content": "+1", "user": {"login": "someone-else"}}]):
+            n = it.apply_approved(self._c(), self.LABELS)
+        self.assertEqual(n, 0)
+        add.assert_not_called()
+
+    @mock.patch.object(gh, "repo_owner", return_value="brandonrc")
+    @mock.patch.object(gh, "update_comment")
+    @mock.patch.object(gh, "add_labels")
+    def test_thumbs_down_dismisses(self, add, upd, _):
+        body = "ak-bot triage proposal (not applied): `type:bug` (0.7)"
+        with mock.patch.object(gh, "search_issues_with_comment", return_value=[5]), \
+             mock.patch.object(gh, "issue_comments", return_value=[{"id": 11, "body": body}]), \
+             mock.patch.object(gh, "comment_reactions", return_value=[{"content": "-1", "user": {"login": "brandonrc"}}]):
+            c = self._c()
+            it.apply_approved(c, self.LABELS)
+        add.assert_not_called()
+        self.assertIn("dismissed by @brandonrc", upd.call_args[0][2])
+        self.assertIn("proposal -1", c.log.records[0].action)

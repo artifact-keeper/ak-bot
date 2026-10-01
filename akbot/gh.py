@@ -10,6 +10,7 @@ import base64
 import json
 import re
 import subprocess
+import urllib.parse
 from typing import Any
 
 LOG_PREFIX_RE = re.compile(r"^[^\t]*\t[^\t]*\t\d{4}-\d{2}-\d{2}T[0-9:.]+Z ?")
@@ -149,6 +150,23 @@ def pr_diff(repo: str, number: int, max_chars: int = 12000) -> str:
 
 def issue_comments(repo: str, number: int) -> list[dict]:
     return api(f"repos/{repo}/issues/{number}/comments?per_page=100", paginate=True) or []
+
+
+def search_issues_with_comment(repo: str, phrase: str, limit: int = 50) -> list[int]:
+    """Issue numbers whose comments contain `phrase` (GitHub search; lag of
+    minutes is fine for an approval sweep)."""
+    data = api(f"search/issues?q=" + urllib.parse.quote(f'repo:{repo} "{phrase}" in:comments is:issue') + f"&per_page={limit}",
+               check=False) or {}
+    return [i["number"] for i in data.get("items", [])]
+
+
+def comment_reactions(repo: str, comment_id: int) -> list[dict]:
+    return api(f"repos/{repo}/issues/comments/{comment_id}/reactions?per_page=100", paginate=True) or []
+
+
+def repo_owner(repo: str) -> str:
+    data = api(f"repos/{repo}", check=False) or {}
+    return (data.get("owner") or {}).get("login", "")
 
 
 def comment(repo: str, number: int, body: str) -> str:

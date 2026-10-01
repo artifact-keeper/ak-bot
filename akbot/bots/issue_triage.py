@@ -4,9 +4,16 @@ One JEV call per issue, four questions in parallel: type, area, priority,
 regression. Labels are applied at the auto tier, proposed in one comment at
 the suggest tier, and only logged below that. Priority is never applied
 automatically: p0/p1 is a maintainer's call and the label carries weight.
+
+Proposals need no approval; they can be ignored. But a maintainer who agrees
+can react with a thumbs-up on the proposal comment and the next run applies
+every label in it; a thumbs-down dismisses it and records that the model was
+wrong (calibration data). Approvers are the repo owner, AK_BOT_MAINTAINER
+and anyone in AK_BOT_APPROVERS, so a drive-by reaction cannot apply labels.
 """
 from __future__ import annotations
 
+import os
 import re
 
 from .. import gh
@@ -64,6 +71,47 @@ def questions(labels: set[str]) -> dict[str, dict]:
 
 
 AREA_LABELS = {"core", "web-ui", "ci"}
+PROPOSAL_PHRASE = "ak-bot triage proposal"
+PROPOSAL_MARK = "<!-- ak-bot:triage-proposal -->"
+LABEL_IN_PROPOSAL_RE = re.compile(r"`((?:type:|registry/|priority:)[a-z0-9-]+|regression|core|web-ui|ci)`")
+
+
+def approvers(ctx: Context) -> set[str]:
+    names = {gh.repo_owner(ctx.repo), os.environ.get("AK_BOT_MAINTAINER", "")}
+    names |= {x.strip() for x in os.environ.get("AK_BOT_APPROVERS", "").split(",")}
+    return {n for n in names if n}
+
+
+def apply_approved(ctx: Context, labels: set[str]) -> int:
+    """Sweep proposal comments for 👍 / 👎 from an approver."""
+    who = approvers(ctx)
+    handled = 0
+    for n in gh.search_issues_with_comment(ctx.repo, PROPOSAL_PHRASE):
+        for c in gh.issue_comments(ctx.repo, n):
+            body = c.get("body") or ""
+            if PROPOSAL_PHRASE not in body or "applied by" in body or "dismissed by" in body:
+                continue
+            verdict = None
+            for r in gh.comment_reactions(ctx.repo, c["id"]):
+                login = (r.get("user") or {}).get("login", "")
+                if login in who and r.get("content") in ("+1", "-1"):
+                    verdict = (r["content"], login)
+                    break
+            if not verdict:
+                continue
+            proposed = [l for l in LABEL_IN_PROPOSAL_RE.findall(body) if l in labels]
+            if verdict[0] == "+1":
+                action = ctx.act(f"label {', '.join(proposed)}", gh.add_labels, ctx.repo, n, proposed)
+                note = f"\n\n<sub>applied by @{verdict[1]} via 👍</sub>"
+            else:
+                action = f"dismissed by {verdict[1]}"
+                note = f"\n\n<sub>dismissed by @{verdict[1]} via 👎</sub>"
+            if not ctx.dry_run:
+                gh.update_comment(ctx.repo, c["id"], body + note)
+            ctx.log.note(f"issue #{n}", f"proposal {verdict[0]} from {verdict[1]}: {action}")
+            handled += 1
+    return handled
+
 
 
 def is_untriaged(issue: dict) -> bool:
@@ -135,8 +183,9 @@ def act(ctx: Context, issue: dict, res, labels: set[str]) -> None:
     # and lives in the ledger and the decision record instead.
     label_props = [x for x in propose if not x.startswith("`priority:")]
     if label_props:
-        body = ("ak-bot triage proposal (not applied; probability in parentheses): " + ", ".join(propose)
-                + "\n\n<sub>Apply or ignore; ak-bot will not repeat this. React with 👎 if it is wrong.</sub>")
+        body = (f"{PROPOSAL_PHRASE} (not applied; probability in parentheses): " + ", ".join(propose)
+                + "\n\n<sub>Ignore this, or react 👍 to have ak-bot apply these labels on its next run, "
+                  "👎 to dismiss. Only maintainers' reactions count.</sub>\n" + PROPOSAL_MARK)
         actions.append(ctx.act("comment proposal", gh.comment, ctx.repo, n, body))
     elif propose:
         actions.append("priority proposal recorded, not commented: " + ", ".join(propose))
@@ -147,6 +196,12 @@ def act(ctx: Context, issue: dict, res, labels: set[str]) -> None:
 
 def run(ctx: Context, limit: int = 30) -> int:
     labels = gh.repo_labels(ctx.repo)
+    try:
+        n = apply_approved(ctx, labels)
+        if n:
+            print(f"applied or dismissed {n} proposal(s) from maintainer reactions")
+    except (gh.GhError, KeyError, TypeError, ValueError) as e:
+        ctx.log.note("approval sweep", f"skipped: {type(e).__name__}: {str(e)[:200]}")
     todo = [i for i in gh.list_issues(ctx.repo) if is_untriaged(i) and not ctx.ledger.has(f"triage-{i['number']}")]
     todo.sort(key=lambda i: i["number"], reverse=True)
     for issue in todo[:limit]:
