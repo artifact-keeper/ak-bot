@@ -94,3 +94,14 @@ class LedgerTests(unittest.TestCase):
             c.ledger.record("m", "t")
         self.assertEqual(hit, [])
         self.assertEqual(c.log.pending_effects, [])
+
+
+class CliTests(unittest.TestCase):
+    def test_empty_env_cap_is_ignored(self):
+        import os
+        from unittest import mock
+        from akbot.cli import env_int
+        with mock.patch.dict(os.environ, {"AK_BOT_MAX_JEV_CALLS": ""}):
+            self.assertEqual(env_int("AK_BOT_MAX_JEV_CALLS"), 0)
+        with mock.patch.dict(os.environ, {"AK_BOT_MAX_JEV_CALLS": " 7 "}):
+            self.assertEqual(env_int("AK_BOT_MAX_JEV_CALLS"), 7)

@@ -28,6 +28,12 @@ ALLOWED_REPOS = set(filter(None, os.environ.get(
 OWN_REPO = os.environ.get("AK_BOT_OWN_REPO", "artifact-keeper/ak-bot")
 
 
+def env_int(name: str) -> int:
+    """An unset workflow variable arrives as an empty string, not as absence."""
+    raw = os.environ.get(name, "").strip()
+    return int(raw) if raw.isdigit() else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="akbot", description="JEV-powered decision bots for artifact-keeper")
     p.add_argument("bot", choices=sorted(BOTS) + sorted(TOOLS))
@@ -53,7 +59,7 @@ def main(argv: list[str] | None = None) -> int:
 
     modname, params, default_cap = BOTS[a.bot]
     mod = importlib.import_module(modname)
-    cap = a.max_jev_calls or int(os.environ.get("AK_BOT_MAX_JEV_CALLS", "0")) or default_cap
+    cap = a.max_jev_calls or env_int("AK_BOT_MAX_JEV_CALLS") or default_cap
     jev = client_from_env(a.dry_run, max_calls=cap)
     log = DecisionLog(a.bot, a.dry_run)
     ctx = Context(repo=a.repo, jev=jev, dry_run=a.dry_run, log=log)

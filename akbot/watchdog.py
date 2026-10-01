@@ -49,14 +49,15 @@ def latest_run_record(own_repo: str, bot: str) -> dict | None:
     return None
 
 
-def check(own_repo: str, live_list: str, halt: str) -> list[str]:
+def check(own_repo: str, live_list: str, halt: str, dry_run: bool = False) -> list[str]:
     problems: list[str] = []
     live = {x.strip().lower() for x in live_list.split(",") if x.strip()}
     wfs = gh.gh_json("workflow", "list", "-R", own_repo, "--all", "--json", "name,state,path") or []
     for wf in wfs:
         if wf["path"].rsplit("/", 1)[-1] in WORKFLOW_FILES.values() and wf["state"] != "active" and not halt:
-            problems.append(f"workflow `{wf['name']}` is {wf['state']}; re-enabling")
-            gh.gh("workflow", "enable", "-R", own_repo, wf["name"], check=False)
+            problems.append(f"workflow `{wf['name']}` is {wf['state']}; " + ("would re-enable" if dry_run else "re-enabling"))
+            if not dry_run:
+                gh.gh("workflow", "enable", "-R", own_repo, wf["name"], check=False)
     for bot, hours in CADENCE_H.items():
         runs = [r for r in gh.list_runs(own_repo, WORKFLOW_FILES[bot], limit=3) if r["status"] == "completed"]
         if runs and all(r["conclusion"] == "failure" for r in runs):
@@ -103,7 +104,7 @@ def upsert_issue(own_repo: str, problems: list[str], assignee: str, dry_run: boo
 
 def main(a) -> int:
     own = os.environ.get("AK_BOT_OWN_REPO", "artifact-keeper/ak-bot")
-    problems = check(own, os.environ.get("AK_BOT_LIVE", ""), os.environ.get("AK_BOT_HALT", ""))
+    problems = check(own, os.environ.get("AK_BOT_LIVE", ""), os.environ.get("AK_BOT_HALT", ""), a.dry_run)
     out = upsert_issue(own, problems, os.environ.get("AK_BOT_MAINTAINER", ""), a.dry_run)
     print(f"watchdog: {len(problems)} problem(s); {out}")
     for p in problems:
