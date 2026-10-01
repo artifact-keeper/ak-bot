@@ -3,23 +3,40 @@ decision log, and the ledger that makes actions idempotent."""
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass, field
 
 from . import gh
 from .decisions import DecisionLog
 
 LEDGER_TITLE = "ak-bot ledger"
-LEDGER_LABELS = ["automated", "pinned"]   # `pinned` keeps the stale bot away
-MARKER_RE = re.compile(r"ak-bot-id:\s*(\S+)")
+LEDGER_LABELS = ["automated"]
+MARKER_RE = re.compile(r"ak-bot-id:\s*([A-Za-z0-9._-]+)")
+
+
+def month_key(ts: float | None = None) -> str:
+    return time.strftime("%Y-%m", time.gmtime(ts))
+
+
+def previous_month_key(ts: float | None = None) -> str:
+    t = time.gmtime(ts)
+    y, m = (t.tm_year, t.tm_mon - 1) if t.tm_mon > 1 else (t.tm_year - 1, 12)
+    return f"{y:04d}-{m:02d}"
 
 
 class Ledger:
-    """One long-lived issue whose comments record every action taken.
+    """Rolling monthly issues whose comments record every action taken.
 
-    A bot writes `ak-bot-id: <kind>-<id>` when it acts, and checks the set
-    before acting, so reruns of a workflow never repeat a comment, a rerun or
-    a PR. Reading comments is exact; GitHub search is not, and has indexing
-    lag, so it is not used for this.
+    A bot writes `ak-bot-id: <kind>-<id>` when it acts and checks the set
+    before acting, so reruns never repeat a comment, a rerun or a PR.
+
+    The ledger rolls monthly: actions are written to `ak-bot ledger YYYY-MM`,
+    markers are read from every OPEN ledger issue (normally this month's and
+    last month's, plus the original untitled one until it is closed), and a
+    ledger older than last month is closed on sight. Nothing needs history
+    beyond that: triaged issues carry their labels, PRs close, red runs are
+    only considered within hours, preflight audits only look at recent runs.
+    Reading comments is exact; GitHub search is not, and has indexing lag.
     """
 
     def __init__(self, repo: str, dry_run: bool):
@@ -27,13 +44,17 @@ class Ledger:
         self.dry_run = dry_run
         self._number: int | None = None
         self._seen: set[str] | None = None
-        self._pending: list[str] = []
+
+    def _open_ledgers(self) -> list[dict]:
+        hits = gh.issue_search(self.repo, f'"{LEDGER_TITLE}" in:title label:automated', limit=20)
+        return [h for h in hits if h["title"].startswith(LEDGER_TITLE) and h["state"].lower() == "open"]
 
     def number(self) -> int | None:
+        """This month's ledger, creating it on first live write."""
         if self._number is None:
-            hits = gh.issue_search(self.repo, f'"{LEDGER_TITLE}" in:title label:automated')
-            for h in hits:
-                if h["title"] == LEDGER_TITLE and h["state"].lower() == "open":
+            want = f"{LEDGER_TITLE} {month_key()}"
+            for h in self._open_ledgers():
+                if h["title"] == want:
                     self._number = h["number"]
                     break
         return self._number
@@ -41,11 +62,21 @@ class Ledger:
     def seen(self) -> set[str]:
         if self._seen is None:
             self._seen = set()
-            n = self.number()
-            if n:
-                for c in gh.issue_comments(self.repo, n):
+            keep = {f"{LEDGER_TITLE} {month_key()}", f"{LEDGER_TITLE} {previous_month_key()}", LEDGER_TITLE}
+            for h in self._open_ledgers():
+                if h["title"] not in keep:
+                    self._close_old(h)
+                    continue
+                for c in gh.issue_comments(self.repo, h["number"]):
                     self._seen.update(MARKER_RE.findall(c.get("body") or ""))
         return self._seen
+
+    def _close_old(self, h: dict) -> None:
+        if self.dry_run:
+            print(f"[ledger:dry-run] would close old ledger #{h['number']} ({h['title']})")
+            return
+        gh.comment(self.repo, h["number"], "Rolled over: this ledger is older than last month and is no longer read.")
+        gh.gh("issue", "close", "-R", self.repo, str(h["number"]))
 
     def has(self, marker: str) -> bool:
         return marker in self.seen()
@@ -59,9 +90,10 @@ class Ledger:
         n = self.number()
         if n is None:
             url = gh.create_issue(
-                self.repo, LEDGER_TITLE,
-                "Audit trail for ak-bot actions. Each comment is one action with its `ak-bot-id` marker; "
-                "bots read this thread to stay idempotent. Do not close.",
+                self.repo, f"{LEDGER_TITLE} {month_key()}",
+                "Audit trail for ak-bot actions this month. Each comment is one action with its `ak-bot-id` "
+                "marker; bots read this and last month's ledger to stay idempotent, and close older ones. "
+                "Delete a comment to make its subject eligible again.",
                 [l for l in LEDGER_LABELS if l in gh.repo_labels(self.repo)],
             )
             self._number = n = int(url.rstrip("/").rsplit("/", 1)[-1])

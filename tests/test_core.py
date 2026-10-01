@@ -38,3 +38,34 @@ class TierTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LedgerTests(unittest.TestCase):
+    def test_month_keys(self):
+        from akbot.context import month_key, previous_month_key
+        import calendar
+        jan = calendar.timegm((2026, 1, 15, 0, 0, 0))
+        self.assertEqual(month_key(jan), "2026-01")
+        self.assertEqual(previous_month_key(jan), "2025-12")
+
+    def test_reads_current_previous_and_legacy_and_closes_older(self):
+        from unittest import mock
+        from akbot import gh
+        from akbot.context import Ledger, month_key, previous_month_key
+        issues = [
+            {"number": 1, "title": "ak-bot ledger", "state": "open"},
+            {"number": 2, "title": f"ak-bot ledger {previous_month_key()}", "state": "open"},
+            {"number": 3, "title": f"ak-bot ledger {month_key()}", "state": "open"},
+            {"number": 4, "title": "ak-bot ledger 2020-01", "state": "open"},
+        ]
+        comments = {1: [{"body": "x\n<sub>ak-bot-id: a</sub>"}], 2: [{"body": "ak-bot-id: b"}], 3: [{"body": "ak-bot-id: c"}], 4: [{"body": "ak-bot-id: old"}]}
+        closed = []
+        with mock.patch.object(gh, "issue_search", return_value=issues), \
+             mock.patch.object(gh, "issue_comments", side_effect=lambda r, n: comments[n]), \
+             mock.patch.object(gh, "comment"), \
+             mock.patch.object(gh, "gh", side_effect=lambda *a, **k: closed.append(a)):
+            led = Ledger("o/r", dry_run=False)
+            self.assertEqual(led.seen(), {"a", "b", "c"})
+            self.assertEqual(led.number(), 3)
+        self.assertEqual(len(closed), 1)
+        self.assertIn("4", closed[0])
