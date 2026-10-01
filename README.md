@@ -1,0 +1,1 @@
+Decision records committed by every ak-bot run, one file per run under records/YYYY/MM/. Read by scripts/calibrate.py, akbot undo and akbot watchdog.
