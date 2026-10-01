@@ -80,9 +80,9 @@ jobs:
           identity=github.token; can_write=false
           if [ "$HAS_APP" = true ]; then identity=app; can_write=true
           elif [ "$HAS_PAT" = true ]; then identity=pat; can_write=true; fi
-          live_list=$(printf '%s' "$LIVE_LIST" | tr -d '[:space:]' | tr 'A-Z' 'a-z')
+          want=$(printf '%s' "$LIVE_LIST" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
           listed=false
-          if [ "$live_list" = all ] || printf ',%s,' "$live_list" | grep -q ",$BOT,"; then listed=true; fi
+          if [ "$want" = all ] || printf ',%s,' "$want" | grep -q ",$BOT,"; then listed=true; fi
           dry=true
           if [ "$EVENT" = workflow_dispatch ]; then
             [ "$DRY_INPUT" = false ] && dry=false
