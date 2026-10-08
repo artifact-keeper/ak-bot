@@ -1,0 +1,2 @@
+{"action": "verdict READY; no undocumented PRs listed", "answers": {}, "bot": "changelog-drafter", "dry_run": true, "effects": [], "model": "deterministic", "questions_version": "n/a", "run_id": "37761196986", "subject": "run 37673554232", "tier": "auto", "ts": 1791453959.7546792, "url": ""}
+{"bot": "changelog-drafter", "decisions": 1, "dry_run": true, "elapsed_ms": 0.0, "identity": "app", "jev_calls": 0, "kind": "run", "missing_field_answers": 0, "model": "jev-latest", "run_id": "37761196986", "state_bytes": 0, "ts": 1791453959.7549236, "usage": {}}
