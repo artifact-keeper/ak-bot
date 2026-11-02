@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/artifact-keeper/.github/main/brand/logo-horizontal-dark.png">
+    <img alt="Artifact Keeper" src="https://raw.githubusercontent.com/artifact-keeper/.github/main/brand/logo-horizontal-light.png" width="360">
+  </picture>
+</p>
+
 # ak-bot
 
 <img src="assets/avatar.png" alt="Jev, the ak-bot avatar" width="160" align="right">
