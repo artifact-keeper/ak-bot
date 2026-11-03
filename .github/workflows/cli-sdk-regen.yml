@@ -1,0 +1,165 @@
+name: cli-sdk-regen
+
+# Every 6 hours: is there an artifact-keeper-api tag newer than the CLI's
+# API_VERSION? If so, regenerate the CLI's SDK and open or update one PR on
+# artifact-keeper-cli. If the CLI no longer compiles, the PR is a draft and an
+# issue says why. If generation itself fails, there's only the issue. Neither
+# merges anything. No JEV call: there's nothing to decide.
+#
+# Identity: the GitHub App (AK_BOT_APP_ID, AK_BOT_APP_PRIVATE_KEY) because a PR
+# opened with github.token gets no CI. The token is minted after the CLI's build
+# has run, so the build's dependencies never run alongside it. The App has no
+# workflows permission, and this never changes .github/workflows.
+#
+# Live vs dry: as in base-image-bump. A manual dispatch honours its dry_run input;
+# a scheduled run is live only when AK_BOT_LIVE lists cli-sdk-regen or is "all".
+# AK_BOT_HALT stops every write.
+
+on:
+  schedule:
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Regenerate, but write nothing'
+        type: boolean
+        default: true
+      tag:
+        description: 'API tag to use instead of the newest, such as v1.11.9. It need not be newer than the pin'
+        type: string
+        default: ''
+
+permissions:
+  contents: write     # commit the run record to this repo's records branch
+  issues: write       # the failure alert, in this repo
+
+concurrency:
+  group: cli-sdk-regen
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # secrets is not an allowed context in a step if; env is.
+      AK_BOT_APP_ID: ${{ secrets.AK_BOT_APP_ID }}
+      WORK: ${{ github.workspace }}/../regen
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Decide mode
+        id: mode
+        env:
+          EVENT: ${{ github.event_name }}
+          DRY_INPUT: ${{ inputs.dry_run }}
+          LIVE_LIST: ${{ vars.AK_BOT_LIVE }}
+          HALT: ${{ vars.AK_BOT_HALT }}
+          BOT: cli-sdk-regen
+        run: |
+          identity=github.token; can_write=false
+          if [ -n "$AK_BOT_APP_ID" ]; then identity=app; can_write=true; fi
+          want=$(printf '%s' "$LIVE_LIST" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+          listed=false
+          if [ "$want" = all ] || printf ',%s,' "$want" | grep -q ",$BOT,"; then listed=true; fi
+          dry=true
+          if [ "$EVENT" = workflow_dispatch ]; then
+            [ "$DRY_INPUT" = false ] && dry=false
+          elif [ "$listed" = true ]; then
+            dry=false
+          fi
+          [ "$can_write" = true ] || dry=true
+          if [ -n "$HALT" ]; then
+            dry=true
+            echo "::warning title=ak-bot halted::AK_BOT_HALT=$HALT; no writes this run"
+          fi
+          echo "::notice::$BOT mode: dry_run=$dry identity=$identity listed=$listed"
+          {
+            echo "dry_run=$dry"
+            echo "identity=$identity"
+          } >> "$GITHUB_OUTPUT"
+          echo "dry_run=$dry identity=$identity" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Poll
+        id: poll
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: scripts/cli-sdk-regen.sh poll
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        if: steps.poll.outputs.tag != ''
+        with:
+          components: rustfmt
+
+      # No token on purpose: this compiles and runs the CLI's dependencies.
+      - name: Regenerate
+        if: steps.poll.outputs.tag != ''
+        env:
+          TAG: ${{ steps.poll.outputs.tag }}
+        run: scripts/cli-sdk-regen.sh generate
+
+      - name: Mint a scoped app token
+        id: app
+        if: steps.poll.outputs.tag != '' && env.AK_BOT_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.AK_BOT_APP_ID }}
+          private-key: ${{ secrets.AK_BOT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: artifact-keeper-cli
+          permission-metadata: read
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+
+      - name: Name the App
+        if: steps.app.outputs.app-slug != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLUG: ${{ steps.app.outputs.app-slug }}
+        run: echo "::notice::Minted a token for App $SLUG, id $(gh api "apps/$SLUG" --jq .id)"
+
+      - name: Publish
+        if: steps.poll.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
+          BOT_SLUG: ${{ steps.app.outputs.app-slug }}
+          TAG: ${{ steps.poll.outputs.tag }}
+          PIN: ${{ steps.poll.outputs.pin }}
+          DRY_RUN: ${{ steps.mode.outputs.dry_run }}
+          MAINTAINER: ${{ vars.AK_BOT_MAINTAINER }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: scripts/cli-sdk-regen.sh publish
+
+      - name: Keep the run record
+        # The watchdog's heartbeat. See base-image-bump.
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRY: ${{ steps.mode.outputs.dry_run }}
+          IDENTITY: ${{ steps.mode.outputs.identity }}
+          TAG: ${{ steps.poll.outputs.tag }}
+        run: |
+          name="cli-sdk-regen-${{ github.run_id }}-${{ github.run_attempt }}.jsonl"
+          record=$(jq -cn --argjson ts "$(date +%s)" --argjson dry "${DRY:-true}" --arg identity "$IDENTITY" --arg tag "$TAG" \
+            '{kind: "run", bot: "cli-sdk-regen", ts: $ts, dry_run: $dry, identity: $identity, model: "none", tag: $tag}')
+          gh api -X PUT "repos/${{ github.repository }}/contents/records/$(date -u +%Y/%m)/$name" \
+            -f branch=records -f message="records: $name (run ${{ github.run_id }})" \
+            -f content="$(printf '%s\n' "$record" | base64 -w0)" --silent
+
+      - name: Alert on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: "ak-bot: cli-sdk-regen failed"
+          URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          n=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "\"$TITLE\" in:title" --json number,title \
+                --jq ".[] | select(.title == \"$TITLE\") | .number" | head -1)
+          body="Run $URL failed (event: $GITHUB_EVENT_NAME, attempt: $GITHUB_RUN_ATTEMPT)."
+          if [ -n "$n" ]; then gh issue comment -R "$GITHUB_REPOSITORY" "$n" --body "$body"
+          else gh issue create -R "$GITHUB_REPOSITORY" --title "$TITLE" --body "$body"; fi
