@@ -84,8 +84,13 @@ operation_diff() {
   gh api "repos/$API_REPO/contents/openapi.json?ref=v$pin" -H 'Accept: application/vnd.github.raw' > "$old"
   jq -r "$ops" "$old" | sort > "$WORK/old.ops"
   jq -r "$ops" "$new" | sort > "$WORK/new.ops"
-  echo "**Added:**"; echo; comm -13 "$WORK/old.ops" "$WORK/new.ops" | sed 's/^/- `/; s/$/`/' | head -200; echo
-  echo "**Removed:**"; echo; comm -23 "$WORK/old.ops" "$WORK/new.ops" | sed 's/^/- `/; s/$/`/' | head -200 || true
+  list_ops() {
+    local ops
+    ops="$(comm "$1" "$WORK/old.ops" "$WORK/new.ops" | sed 's/^/- `/; s/$/`/')"
+    echo "${ops:-None.}" | sed -n '1,200p'
+  }
+  echo "**Operations added:**"; echo; list_ops -13; echo
+  echo "**Operations removed:**"; echo; list_ops -23
 }
 
 publish() {
