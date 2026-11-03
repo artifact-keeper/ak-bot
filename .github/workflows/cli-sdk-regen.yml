@@ -118,9 +118,9 @@ jobs:
       - name: Name the App
         if: steps.app.outputs.app-slug != ''
         env:
-          GH_TOKEN: ${{ github.token }}
           SLUG: ${{ steps.app.outputs.app-slug }}
-        run: echo "::notice::Minted a token for App $SLUG, id $(gh api "apps/$SLUG" --jq .id)"
+        # Anonymous, because a repository token gets a 403 from this endpoint.
+        run: echo "::notice::Minted a token for App $SLUG, id $(curl -fsSL "https://api.github.com/apps/$SLUG" | jq .id)"
 
       - name: Publish
         if: steps.poll.outputs.tag != ''
