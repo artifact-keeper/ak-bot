@@ -54,6 +54,8 @@ poll() {
 generate() {
   local tag="${TAG:?TAG is required}" version="${TAG#v}"
   mkdir -p "$WORK"
+  # The logs go into the PR and the issue, and the toolchain action turns color on.
+  export CARGO_TERM_COLOR=never
   git clone -q --filter=blob:none "https://github.com/$CLI_REPO" "$CLI"
   git -c advice.detachedHead=false clone -q --depth 1 --branch "$tag" "https://github.com/$API_REPO" "$API"
   cd "$CLI"
@@ -67,7 +69,7 @@ generate() {
     return 0
   fi
   # Also moves the SDK's version in Cargo.lock, which the CLI's MSRV job needs.
-  if ! cargo check --workspace --message-format short > "$WORK/check.log" 2>&1; then
+  if ! cargo check -q --workspace --message-format short > "$WORK/check.log" 2>&1; then
     echo check > "$WORK/result"
     tail -40 "$WORK/check.log"
     return 0
