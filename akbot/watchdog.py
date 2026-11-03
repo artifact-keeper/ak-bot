@@ -23,7 +23,8 @@ from . import gh
 
 WATCHDOG_TITLE = "ak-bot watchdog"
 CADENCE_H = {"issue-triage": 6, "pr-review-router": 4, "red-run-classifier": 3,
-             "changelog-drafter": 36, "preflight-audit": 36, "base-image-bump": 24 * 8}
+             "changelog-drafter": 36, "preflight-audit": 36, "base-image-bump": 24 * 8,
+             "cli-sdk-regen": 6}
 WORKFLOW_FILES = {bot: f"{bot}.yml" for bot in CADENCE_H}
 
 

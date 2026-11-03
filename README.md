@@ -33,6 +33,7 @@ was not bumped, and the version plus a hash of the wording is written into every
 | `preflight-audit` | 21:30 weekdays + 03:30 catch-up | verdict supported, scope confusion, weakened by skips | (a deterministic evidence mismatch opens an issue) | digest comment |
 | `red-run-classifier` | every 3h, 8h lookback | cause, rerun-would-pass, severity per red run | rerun an allowlisted flake once; issue per (workflow, branch) for a regression | digest comment |
 | `base-image-bump` | Wed 15:00 + 21:00 | urgency, remedy, auto-PR-safe | repoint PR, or upstream override request | comment on the tracker |
+| `cli-sdk-regen` | every 6h | nothing, no JEV call: the newest `artifact-keeper-api` tag vs the CLI's `API_VERSION` | opens or updates one PR per tag on `artifact-keeper-cli` (a draft plus an issue if it doesn't compile) | |
 
 The schedules bracket when the upstream workflows actually finish (Release Preflight completes
 17:30 to 20:10 UTC despite its 13:17 cron; the base image watch 12:00 to 13:30 Wednesdays).
@@ -90,8 +91,9 @@ times runs per day is asserted under 400 by `tests/test_budget.py`.
 The workflows accept a **GitHub App** (secrets `AK_BOT_APP_ID`, `AK_BOT_APP_PRIVATE_KEY`;
 `scripts/create-github-app.py` creates one through the manifest flow) or a **token**
 (`AK_BOT_TOKEN`). Each workflow mints a token scoped to exactly the repositories and
-permissions that bot needs. Install the App on `artifact-keeper` and `trivy` only. With neither
-secret, `github.token` is used and every run is forced dry.
+permissions that bot needs. With neither secret, `github.token` is used and every run is forced
+dry. The App has no workflows permission, so nothing here can change another repository's
+`.github/workflows`.
 
 Repository variables on ak-bot:
 
