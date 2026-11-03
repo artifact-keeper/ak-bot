@@ -33,7 +33,7 @@ was not bumped, and the version plus a hash of the wording is written into every
 | `preflight-audit` | 21:30 weekdays + 03:30 catch-up | verdict supported, scope confusion, weakened by skips | (a deterministic evidence mismatch opens an issue) | digest comment |
 | `red-run-classifier` | every 3h, 8h lookback | cause, rerun-would-pass, severity per red run | rerun an allowlisted flake once; issue per (workflow, branch) for a regression | digest comment |
 | `base-image-bump` | Wed 15:00 + 21:00 | urgency, remedy, auto-PR-safe | repoint PR, or upstream override request | comment on the tracker |
-| `cli-sdk-regen` | every 6h | nothing, no JEV call: the newest `artifact-keeper-api` tag vs the CLI's `API_VERSION` | opens or updates one PR per tag on `artifact-keeper-cli` (a draft plus an issue if it doesn't compile) | |
+| `cli-sdk-regen` | every 6h | nothing, no JEV call: the newest `artifact-keeper-api` tag vs the CLI's `API_VERSION` | opens or updates one PR per tag on `artifact-keeper-cli`, with the SDK and `ROUTES.json` regenerated and the routes added and removed in its body (a draft plus an issue if it doesn't compile) | |
 
 The schedules bracket when the upstream workflows actually finish (Release Preflight completes
 17:30 to 20:10 UTC despite its 13:17 cron; the base image watch 12:00 to 13:30 Wednesdays).

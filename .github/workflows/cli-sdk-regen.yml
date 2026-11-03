@@ -1,7 +1,8 @@
 name: cli-sdk-regen
 
 # Every 6 hours: is there an artifact-keeper-api tag newer than the CLI's
-# API_VERSION? If so, regenerate the CLI's SDK and open or update one PR on
+# API_VERSION? If so, regenerate the CLI's SDK, and its ROUTES.json from
+# artifact-keeper at the same tag, and open or update one PR on
 # artifact-keeper-cli. If the CLI no longer compiles, the PR is a draft and an
 # issue says why. If generation itself fails, there's only the issue. Neither
 # merges anything. No JEV call: there's nothing to decide.
