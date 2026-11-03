@@ -129,7 +129,7 @@ coverage_diff() {
   elif grep -q '^## Problems' "$WORK/coverage.log"; then
     echo "**Coverage gate:** fails until each of these is dealt with. A new route needs a command in \`src/registry.rs\`, or an exclusion with a reason, which this workflow never adds."
     echo
-    sed -n '/^## Problems/,$p' "$WORK/coverage.log" | sed -n '2,200p' | cut -c1-300
+    sed -n '/^## Problems/,$p' "$WORK/coverage.log" | sed -n '3,200p' | cut -c1-300
   else
     echo "**Coverage gate:** didn't run. See the workflow run."
   fi
